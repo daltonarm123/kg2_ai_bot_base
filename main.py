@@ -6,9 +6,10 @@ KG2 AI Bot - single file main.py
 - Early-game: EXPLORE HARD using /WebService/Kingdoms.asmx/Explore
 - Event-driven sleeper with human-like nights
 - Auto-clear explore busy using a local return timer
+- FIX: Explore excludes peasants (API only accepts troop types), ensures at least 1 valid troop if available
 """
 
-import os, sys, json, asyncio, logging, random, math
+import os, sys, json, asyncio, logging, random
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -83,17 +84,18 @@ logger = logging.getLogger("kg2bot")
 
 class KG2Client:
     TROOP_ID = {
-        "peasants": 1,
-        "footmen": 17,
-        "pikemen": 18,
-        "archers": 20,
-        "crossbow": 22,
+        # Valid troop types for EXPLORE (peasants excluded from payload)
+        "footmen":   17,
+        "pikemen":   18,
+        "archers":   20,
+        "crossbow":  22,
         "light_cav": 23,
         "heavy_cav": 24,
-        "knights": 25,
-        "spies": 5,
-        "priests": 6,
-        "diplomats": 30,
+        "knights":   25,
+        # (Elites often ID 19; add if Explore supports them)
+        # "elites":  19,
+        # Non-combatants (do NOT send in Explore payload):
+        # "peasants": 1, "spies": 5, "priests": 6, "diplomats": 30
     }
 
     def __init__(self, cfg: Config):
@@ -198,6 +200,7 @@ class KG2Client:
         ]
         for path, body in attempts:
             try:
+                d = self.post_asmx  # ref
                 d = await self.post_asmx(path, body, referer)
                 if d.get("ReturnValue") == 1 or d.get("success"):
                     return d
@@ -207,18 +210,21 @@ class KG2Client:
                 continue
         return {"ReturnValue": 0, "ReturnString": "No research train endpoint accepted the request"}
 
-    # ---- Explore (exact shape with troops JSON-string) ----
-    async def explore(self, send: Dict[str, int]) -> dict:
+    # ---- Explore (exact shape with troops JSON-string; peasants excluded) ----
+    async def explore(self, send_valid_troops: Dict[str, int], log_label: str = "") -> dict:
         """
         POST /WebService/Kingdoms.asmx/Explore
         Body: { accountId, token, kingdomId, troops: "[{TroopTypeID,AmountToSend}, ...]" }
         Referer: /warroom
+        NOTE: peasants are NOT included; API expects troop types only.
         """
         arr = []
-        for k, n in send.items():
-            if not n: continue
+        for k, n in send_valid_troops.items():
+            if not n: 
+                continue
             tid = self.TROOP_ID.get(k)
-            if not tid: continue
+            if not tid:
+                continue
             arr.append({"TroopTypeID": tid, "AmountToSend": int(n)})
 
         body = {
@@ -227,7 +233,8 @@ class KG2Client:
             "kingdomId": self.cfg.kingdom_id,
             "troops": json.dumps(arr),  # IMPORTANT: stringified array
         }
-        return await self.post_asmx("/WebService/Kingdoms.asmx/Explore", body, self.cfg.referer_war)
+        data = await self.post_asmx("/WebService/Kingdoms.asmx/Explore", body, self.cfg.referer_war)
+        return data
 
 # -----------------------
 # State & Normalizers
@@ -429,28 +436,67 @@ class Bot:
             "knights":   u.get("knights", 0),
         }
 
+    def _filter_valid_explore_troops(self, to_send: Dict[str, int]) -> Dict[str, int]:
+        """Return only troop types the Explore API accepts (no peasants/spies/priests/diplomats)."""
+        valid = {}
+        for k in ("footmen","pikemen","archers","crossbow","light_cav","heavy_cav","knights"):
+            n = int(to_send.get(k, 0) or 0)
+            if n > 0:
+                valid[k] = n
+        return valid
+
     async def plan_exploration(self, st: KingdomState) -> str:
         if st.queues.get("explore_busy"):
             return "Explore: busy"
-        keep = {"peasants": 20, "footmen": 10, "pikemen": 10, "archers": 10, "light_cav": 0, "heavy_cav": 0, "knights": 0}
+
+        # Keep a small home guard (footmen keep lowered to 5 so we can send 1)
+        keep = {"peasants": 20, "footmen": 5, "pikemen": 10, "archers": 10, "light_cav": 0, "heavy_cav": 0, "knights": 0}
         idl = self.idle_units(st)
         pct = 0.85 if self.is_early_game(st) else 0.4
-        to_send = {}
+
+        # plan raw
+        to_send_raw = {}
         for k in ("peasants","footmen","pikemen","archers","light_cav","heavy_cav","knights"):
             avail = max(0, idl.get(k, 0) - keep.get(k, 0))
-            to_send[k] = int(avail * pct)
-        if sum(to_send.values()) < 25 and idl.get("peasants", 0) > keep["peasants"]:
-            to_send["peasants"] = max(to_send["peasants"], min(50, idl["peasants"] - keep["peasants"]))
-        if st.resources.get("gold", 0) < 50:
-            return "Explore: waiting for gold ≥ 50"
-        res = await self.client.explore(to_send)
+            to_send_raw[k] = int(avail * pct)
+
+        # ensure at least some peasants go in our "intent" (for planning logs),
+        # but DO NOT send peasants to the API payload.
+        if sum(to_send_raw.values()) < 25 and idl.get("peasants", 0) > keep["peasants"]:
+            to_send_raw["peasants"] = max(to_send_raw["peasants"], min(50, idl["peasants"] - keep["peasants"]))
+
+        # filter to only valid troop types for the API
+        to_send_valid = self._filter_valid_explore_troops(to_send_raw)
+
+        # ensure we send at least 1 valid troop if available
+        if sum(to_send_valid.values()) == 0:
+            # try to send 1 of the largest available valid troop type
+            candidates = [(k, max(0, idl.get(k, 0) - keep.get(k, 0))) for k in ("footmen","pikemen","archers","crossbow","light_cav","heavy_cav","knights")]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            for k, avail in candidates:
+                if avail > 0:
+                    to_send_valid[k] = 1
+                    break
+
+        # If still nothing valid, we truly have no troops to explore with
+        if sum(to_send_valid.values()) == 0:
+            return "Explore: no eligible troops at home (train/return first)"
+
+        # Optional: if explore has a gold cost in your world, gate here (set to 0 if not)
+        if st.resources.get("gold", 0) < 0:
+            return "Explore: waiting for gold"
+
+        # Fire explore
+        res = await self.client.explore(to_send_valid, log_label="explore")
         if str(res.get("ReturnValue")) == "1":
             # set local return timer: shorter early, longer later (with jitter)
             now = local_now(self.cfg.tz_name)
             minutes = random.uniform(30, 45) if self.is_early_game(st) else random.uniform(60, 90)
             self._explore_back_at = now + timedelta(minutes=minutes)
             st.queues["explore_busy"] = True
-            return f"Explore sent: {to_send} (ETA ~{minutes:.0f}m)"
+            self.logger.info(f"Explore payload (raw-plan vs API-valid): raw={to_send_raw} valid={to_send_valid}")
+            return f"Explore sent (ETA ~{minutes:.0f}m)"
+        self.logger.info(f"Explore payload (raw-plan vs API-valid): raw={to_send_raw} valid={to_send_valid}")
         return f"Explore failed: {res.get('ReturnString','unknown')}"
 
     async def maybe_fix_storage(self, st: KingdomState) -> Optional[str]:
