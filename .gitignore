@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local state
+.env
+brain_state.json
+logs/
+snapshots/
