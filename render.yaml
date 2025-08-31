@@ -1,0 +1,29 @@
+services:
+- type: worker
+  name: kg2-bot
+  env: python
+  plan: starter
+  buildCommand: pip install -r requirements.txt
+  startCommand: python main.py
+  envVars:
+  - key: KG2_BASE_URL
+    value: https://www.kingdomgame.net
+  - key: KG2_WORLD_ID
+    value: "1"
+  - key: KG2_MOCK
+    value: "false"
+  # The three below you’ll set securely in the Render UI (don’t commit values):
+  - key: KG2_ACCOUNT_ID
+    sync: false
+  - key: KG2_KINGDOM_ID
+    sync: false
+  - key: KG2_TOKEN
+    sync: false
+  - key: KG2_REFERER_OVERVIEW
+    value: https://www.kingdomgame.net/overview
+  - key: KG2_REFERER_BUILDINGS
+    value: https://www.kingdomgame.net/buildings
+  - key: KG2_REFERER_WAR
+    value: https://www.kingdomgame.net/warroom
+  - key: KG2_REFERER_RESEARCH
+    value: https://www.kingdomgame.net/research
