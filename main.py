@@ -4,13 +4,39 @@ KG2 AI Bot - single file main.py
 - Live + mock modes
 - Render-ready (env secrets)
 - Early-game: EXPLORE HARD using /WebService/Kingdoms.asmx/Explore
+- Event-driven sleeper with human-like nights
+- Auto-clear explore busy using a local return timer
 """
 
-import os, sys, json, asyncio, logging, math, random
+import os, sys, json, asyncio, logging, random, math
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+try:
+    import zoneinfo  # py>=3.9
+except Exception:
+    zoneinfo = None
 
 import httpx
+
+# -----------------------
+# Time helpers
+# -----------------------
+
+def local_now(tz_name: str = None) -> datetime:
+    tz = None
+    if tz_name and zoneinfo:
+        try:
+            tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    return datetime.now(tz or timezone.utc)
+
+def in_human_sleep_window(tz_name: str = "America/Chicago") -> bool:
+    # human-ish sleep window 01:00–06:00 local
+    now = local_now(tz_name)
+    h = now.hour
+    return 1 <= h < 6
 
 # -----------------------
 # Config / Environment
@@ -39,6 +65,7 @@ class Config:
     timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "20"))
 
     origin_url: str = "https://www.kingdomgame.net"
+    tz_name: str = os.getenv("KG2_TZ", "America/Chicago")
 
 # -----------------------
 # Logging
@@ -96,7 +123,6 @@ class KG2Client:
                 "Origin": self.cfg.origin_url,
             }
         )
-        # do not raise; some hosts mask with 500 on warmup — not fatal here
         logger.info("Warmup GET /overview -> %s", r.status_code)
 
     async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
@@ -337,6 +363,8 @@ class Bot:
         self.cfg = cfg
         self.client = KG2Client(cfg)
         self.logger = logger
+        # local timer: when we expect explorers back home
+        self._explore_back_at: Optional[datetime] = None
 
     async def fetch_state(self) -> KingdomState:
         kd = await self.client.get_details()
@@ -352,6 +380,13 @@ class Bot:
         skills = normalize_skills(sk)
         training = normalize_training_skills(ts)
 
+        # compute explore_busy from local timer
+        now = local_now(self.cfg.tz_name)
+        explore_busy_local = bool(self._explore_back_at and now < self._explore_back_at)
+        # auto-clear if timer elapsed
+        if self._explore_back_at and now >= self._explore_back_at:
+            self._explore_back_at = None
+
         st = KingdomState(
             id=int(kd.get("id", 0)),
             name=kd.get("name", ""),
@@ -366,7 +401,7 @@ class Bot:
             queues={
                 "training_busy": any(v > 0 for v in inprog_units.values()),
                 "building_busy": any(v > 0 for v in inprog_build.values()),
-                "explore_busy": False,  # set true locally when we send
+                "explore_busy": explore_busy_local,
                 "training_inprog": inprog_units,
                 "returning": returning,
                 "building_inprog": inprog_build,
@@ -410,8 +445,12 @@ class Bot:
             return "Explore: waiting for gold ≥ 50"
         res = await self.client.explore(to_send)
         if str(res.get("ReturnValue")) == "1":
+            # set local return timer: shorter early, longer later (with jitter)
+            now = local_now(self.cfg.tz_name)
+            minutes = random.uniform(30, 45) if self.is_early_game(st) else random.uniform(60, 90)
+            self._explore_back_at = now + timedelta(minutes=minutes)
             st.queues["explore_busy"] = True
-            return f"Explore sent: {to_send}"
+            return f"Explore sent: {to_send} (ETA ~{minutes:.0f}m)"
         return f"Explore failed: {res.get('ReturnString','unknown')}"
 
     async def maybe_fix_storage(self, st: KingdomState) -> Optional[str]:
@@ -467,6 +506,41 @@ class Bot:
         res = await self.client.train_skill(sid)
         return res.get("ReturnString", f"Research queued: {name}")
 
+    def compute_idle_wait_minutes(self, st: KingdomState) -> float:
+        """
+        Event-driven idle timer:
+          - if any queue busy ⇒ short nap 3–12 min (8–18 at night)
+          - if waiting for gold ⇒ estimate, but cap to 20 min day / 45 min night
+          - near-cap storage ⇒ wake sooner
+          - otherwise: 5–10 min poll (20–60 min at night)
+        """
+        tz_name = self.cfg.tz_name
+
+        # 1) If anything is in progress, short power nap
+        if st.queues.get("building_busy") or st.queues.get("training_busy") or st.queues.get("explore_busy"):
+            base = random.uniform(3, 12)
+            if in_human_sleep_window(tz_name):
+                base = random.uniform(8, 18)
+            return base
+
+        # 2) Avoid wasting storage: wake soon if near-cap
+        near_cap_wood  = st.storage["wood"]  > 0 and st.resources["wood"]  >= st.storage["wood"]  * 0.95
+        near_cap_stone = st.storage["stone"] > 0 and st.resources["stone"] >= st.storage["stone"] * 0.95
+        if near_cap_wood or near_cap_stone:
+            return random.uniform(4, 8)
+
+        # 3) If resource-blocked, estimate time to a useful cushion
+        gold_hr = max(0, st.prod_per_hour.get("gold", 0))
+        target_gold = max(6000, min(20000, st.resources["gold"] + 8000))
+        gold_deficit = max(0, target_gold - st.resources["gold"])
+        wait_for_gold = (gold_deficit / gold_hr * 60) if gold_hr > 0 else 15.0  # minutes
+
+        # 4) Clamp and jitter
+        if in_human_sleep_window(tz_name):
+            return max(12.0, min(45.0, wait_for_gold + random.uniform(-3, 6)))
+        else:
+            return max(5.0, min(20.0, wait_for_gold + random.uniform(-2, 4)))
+
     async def step(self) -> None:
         st = await self.fetch_state()
 
@@ -479,7 +553,11 @@ class Bot:
 
         # Early-game explore-first
         if self.is_early_game(st):
-            self.logger.info("EARLY EXPLORE | land=%s", st.land)
+            idl = self.idle_units(st)
+            self.logger.info(
+                "EARLY EXPLORE | land=%s | idle P/F/Pi/A=%s/%s/%s/%s | explore_busy=%s",
+                st.land, idl["peasants"], idl["footmen"], idl["pikemen"], idl["archers"], st.queues.get("explore_busy")
+            )
             msg = await self.plan_exploration(st)
             self.logger.info(msg)
 
@@ -493,16 +571,11 @@ class Bot:
         rmsg = await self.maybe_research(st)
         self.logger.info(rmsg)
 
-        # Idle wait based on weakest resource
-        gold_hr = st.prod_per_hour.get("gold", 0)
-        food_hr = st.prod_per_hour.get("food", 0)
-        wait_min = 5.0
-        if gold_hr > 0:
-            # try to wait until we have >= 10k gold or a minimum of 5 minutes
-            deficit = max(0, 10000 - st.resources["gold"])
-            if deficit > 0:
-                wait_min = max(5.0, min(30.0, deficit / max(1.0, gold_hr) * 60.0 / 60.0))
-        self.logger.info("Waiting %.1f minutes for resources...", wait_min)
+        # --- Idle / Sleep decision (event-driven) ---
+        wait_min = self.compute_idle_wait_minutes(st)
+        self.logger.info("Idle sleep for %.1f minutes (queues: build=%s train=%s explore=%s, gold/hr=%s)",
+                         wait_min, st.queues.get("building_busy"), st.queues.get("training_busy"),
+                         st.queues.get("explore_busy"), st.prod_per_hour.get("gold", 0))
         await asyncio.sleep(wait_min * 60)
 
     async def run(self):
@@ -518,7 +591,6 @@ class Bot:
                     await self.step()
                 except Exception as e:
                     self.logger.error("Step error: %s", e)
-                    # backoff a bit on errors
                     await asyncio.sleep(30)
         finally:
             await self.client.close()
@@ -529,7 +601,6 @@ class Bot:
 
 if __name__ == "__main__":
     cfg = Config()
-    # quick validation
     if not cfg.mock and (not cfg.account_id or not cfg.token or not cfg.kingdom_id):
         logger.error("Missing live auth env (KG2_ACCOUNT_ID / KG2_TOKEN / KG2_KINGDOM_ID). Set KG2_MOCK=true to run sim.")
         sys.exit(1)
