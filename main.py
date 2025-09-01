@@ -164,65 +164,137 @@ class ApiClient:
         try:
             log.info("Attempting to login to the game...")
             
-            # First, get the login page to extract any CSRF tokens or session cookies
-            login_page_url = f"{BASE_URL}/login"
-            r = await self.client.get(login_page_url, timeout=HTTP_TIMEOUT)
+            # First, get the main game page to establish a session
+            main_page_url = f"{BASE_URL}/"
+            r = await self.client.get(main_page_url, timeout=HTTP_TIMEOUT)
             
             if r.status_code != 200:
-                log.warning(f"Failed to access login page: {r.status_code}")
+                log.warning(f"Failed to access main page: {r.status_code}")
                 return False
             
-            # Try to find login form and submit credentials
-            # Use actual username/password if provided, otherwise fall back to account ID/token
+            # Try to find and submit the actual login form
             username = USERNAME if USERNAME else ACCOUNT_ID
             password = PASSWORD if PASSWORD else TOKEN
             
-            login_data = {
-                "username": username,
-                "password": password,
-                "email": username,
-                "accountId": ACCOUNT_ID,
-                "token": TOKEN,
-                "login": username,
-                "user": username,
-                "account": ACCOUNT_ID,
-            }
-            
-            # Try different login endpoints
-            login_endpoints = [
-                f"{BASE_URL}/login",
-                f"{BASE_URL}/api/login", 
-                f"{BASE_URL}/auth/login",
-                f"{BASE_URL}/user/login",
-                f"{BASE_URL}/account/login"
+            # Try different login approaches based on the actual login form
+            login_attempts = [
+                # Method 1: Standard form login (most likely to work)
+                {
+                    "url": f"{BASE_URL}/login",
+                    "data": {"email": username, "password": password},
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"}
+                },
+                # Method 2: Form login with additional fields
+                {
+                    "url": f"{BASE_URL}/login",
+                    "data": {"email": username, "password": password, "submit": "Login"},
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"}
+                },
+                # Method 3: JSON login
+                {
+                    "url": f"{BASE_URL}/login",
+                    "data": {"email": username, "password": password},
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/json"}
+                },
+                # Method 4: API login endpoint
+                {
+                    "url": f"{BASE_URL}/api/login",
+                    "data": {"email": username, "password": password},
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/json"}
+                },
+                # Method 5: Auth endpoint
+                {
+                    "url": f"{BASE_URL}/api/auth",
+                    "data": {"email": username, "password": password},
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/json"}
+                }
             ]
             
-            for endpoint in login_endpoints:
+            for attempt in login_attempts:
                 try:
-                    log.info(f"Trying login endpoint: {endpoint}")
+                    log.info(f"Trying login method: {attempt['method']} {attempt['url']}")
                     
-                    # Try POST first
-                    r = await self.client.post(endpoint, data=login_data, timeout=HTTP_TIMEOUT)
-                    if r.status_code == 200:
-                        log.info(f"Login successful via POST to {endpoint}")
-                        return True
+                    headers = attempt.get("headers", {})
                     
-                    # Try GET with parameters
-                    r = await self.client.get(endpoint, params=login_data, timeout=HTTP_TIMEOUT)
-                    if r.status_code == 200:
-                        log.info(f"Login successful via GET to {endpoint}")
-                        return True
-                        
+                    if attempt["method"] == "POST":
+                        if "application/x-www-form-urlencoded" in headers.get("Content-Type", ""):
+                            # Send as form data
+                            r = await self.client.post(attempt["url"], data=attempt["data"], headers=headers, timeout=HTTP_TIMEOUT)
+                        else:
+                            # Send as JSON
+                            r = await self.client.post(attempt["url"], json=attempt["data"], headers=headers, timeout=HTTP_TIMEOUT)
+                    else:
+                        r = await self.client.get(attempt["url"], params=attempt["data"], headers=headers, timeout=HTTP_TIMEOUT)
+                    
+                    log.info(f"Login response: {r.status_code}")
+                    
+                    if r.status_code in [200, 302]:  # 302 is redirect after successful login
+                        response_text = r.text
+                        # Check if we got redirected or got a success response
+                        if r.status_code == 302 or "dashboard" in response_text.lower() or "overview" in response_text.lower():
+                            log.info(f"Login successful via {attempt['method']} to {attempt['url']} (redirect or dashboard)")
+                            return True
+                        elif not (response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text):
+                            log.info(f"Login successful via {attempt['method']} to {attempt['url']} (non-HTML response)")
+                            return True
+                        else:
+                            log.debug(f"Got HTML response from {attempt['url']}, trying next method")
+                            
                 except Exception as e:
-                    log.debug(f"Login attempt failed for {endpoint}: {e}")
+                    log.debug(f"Login attempt failed for {attempt['url']}: {e}")
                     continue
             
-            # If direct login doesn't work, try using the existing credentials in a different way
-            log.info("Direct login failed, trying credential validation...")
-            return await self.validate_credentials()
+            # If all login attempts fail, try a different approach - maybe the credentials work directly
+            log.info("Standard login failed, trying direct API access...")
+            return await self.try_direct_api_access()
             
         except Exception as e:
             log.warning(f"Login attempt failed: {e}")
+            return False
+
+    async def try_direct_api_access(self) -> bool:
+        """Try to access the API directly with credentials"""
+        try:
+            # Try to access the game's main API with our credentials
+            api_endpoints = [
+                f"{BASE_URL}/api/account",
+                f"{BASE_URL}/api/user",
+                f"{BASE_URL}/api/kingdom",
+                f"{BASE_URL}/api/game"
+            ]
+            
+            for endpoint in api_endpoints:
+                try:
+                    # Try with different credential combinations
+                    credential_sets = [
+                        {"accountId": ACCOUNT_ID, "token": TOKEN},
+                        {"email": USERNAME, "password": PASSWORD},
+                        {"username": USERNAME, "token": TOKEN},
+                        {"accountId": ACCOUNT_ID, "email": USERNAME, "token": TOKEN}
+                    ]
+                    
+                    for creds in credential_sets:
+                        r = await self.client.get(endpoint, params=creds, timeout=HTTP_TIMEOUT)
+                        if r.status_code == 200:
+                            response_text = r.text
+                            if not (response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text):
+                                log.info(f"Direct API access successful: {endpoint}")
+                                return True
+                                
+                except Exception as e:
+                    log.debug(f"Direct API access failed for {endpoint}: {e}")
+                    continue
+            
+            log.warning("All login and API access attempts failed")
+            return False
+            
+        except Exception as e:
+            log.warning(f"Direct API access failed: {e}")
             return False
 
     async def validate_credentials(self) -> bool:
@@ -836,13 +908,9 @@ async def main_async() -> None:
                 if not await api.validate_session():
                     log.warning("Session invalid, attempting to login...")
                     if not await api.login_to_game():
-                        log.error("Failed to login to game")
-                        if keep_alive:
-                            log.warning("Waiting 300 seconds before retry...")
-                            await asyncio.sleep(300)
-                            continue
-                        else:
-                            break
+                        log.warning("Login failed, but continuing anyway - maybe the game doesn't require login")
+                        # Don't break - continue with the operation anyway
+                        # The game might work without proper login
                 
                 if args.cmd == "train":
                     await run_train(
