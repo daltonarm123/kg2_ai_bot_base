@@ -694,34 +694,60 @@ async def main_async() -> None:
             except Exception as e:
                 log.warning(f"Endpoint discovery failed: {e}")
 
-        if args.cmd == "train":
-            await run_train(
-                api,
-                troop=args.troop.lower(),
-                qty=args.qty,
-                per=args.per,
-                concurrent=args.concurrent,
-                pop_type_id=args.pop_type_id,
-            )
-        elif args.cmd == "build":
-            await run_build(
-                api,
-                building=args.building.lower(),
-                count=args.count,
-                per=args.per,
-                concurrent=args.concurrent,
-                building_type_id=args.building_type_id,
-            )
-        elif args.cmd == "speedup":
-            await run_speedup(api, type_id=args.type_id, amount=args.amount)
-        elif args.cmd == "raw":
-            await run_raw(api, url=args.url, payload_str=args.json)
-        elif args.cmd == "test-endpoints":
-            await run_test_endpoints(api)
-        else:
-            parser.print_help()
-            print_examples()
-            return
+        # Check if we should keep alive and loop
+        keep_alive = os.getenv("KEEP_ALIVE", "0") == "1"
+        
+        while True:
+            try:
+                if args.cmd == "train":
+                    await run_train(
+                        api,
+                        troop=args.troop.lower(),
+                        qty=args.qty,
+                        per=args.per,
+                        concurrent=args.concurrent,
+                        pop_type_id=args.pop_type_id,
+                    )
+                elif args.cmd == "build":
+                    await run_build(
+                        api,
+                        building=args.building.lower(),
+                        count=args.count,
+                        per=args.per,
+                        concurrent=args.concurrent,
+                        building_type_id=args.building_type_id,
+                    )
+                elif args.cmd == "speedup":
+                    await run_speedup(api, type_id=args.type_id, amount=args.amount)
+                elif args.cmd == "raw":
+                    await run_raw(api, url=args.url, payload_str=args.json)
+                elif args.cmd == "test-endpoints":
+                    await run_test_endpoints(api)
+                else:
+                    parser.print_help()
+                    print_examples()
+                    return
+                
+                # If keep_alive is disabled, break after one run
+                if not keep_alive:
+                    break
+                    
+                # If keep_alive is enabled, wait before next run
+                log.info("KEEP_ALIVE=1 enabled. Waiting 60 seconds before next run...")
+                await asyncio.sleep(60)
+                
+            except Exception as e:
+                if "session expired" in str(e).lower() or "loading" in str(e).lower():
+                    if keep_alive:
+                        log.warning("Session expired. Waiting 300 seconds (5 minutes) before retry...")
+                        await asyncio.sleep(300)  # Wait 5 minutes before retry
+                        continue
+                    else:
+                        log.error("Session expired and KEEP_ALIVE=0. Exiting.")
+                        break
+                else:
+                    # Re-raise other exceptions
+                    raise
 
 
 def main() -> None:
