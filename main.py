@@ -297,6 +297,76 @@ class ApiClient:
             log.warning(f"Direct API access failed: {e}")
             return False
 
+    async def explore_game_api(self) -> None:
+        """Explore the game's API to understand how it actually works"""
+        try:
+            log.info("Exploring game API structure...")
+            
+            # Try to access the main game page and look for API clues
+            main_page_url = f"{BASE_URL}/"
+            r = await self.client.get(main_page_url, timeout=HTTP_TIMEOUT)
+            
+            if r.status_code == 200:
+                html_content = r.text
+                
+                # Look for JavaScript files that might contain API endpoints
+                import re
+                js_files = re.findall(r'src=["\']([^"\']*\.js[^"\']*)["\']', html_content, re.IGNORECASE)
+                log.info(f"Found {len(js_files)} JavaScript files to examine")
+                
+                # Look for API endpoints in the HTML
+                api_patterns = re.findall(r'["\']([^"\']*api[^"\']*)["\']', html_content, re.IGNORECASE)
+                if api_patterns:
+                    log.info(f"Found potential API patterns: {api_patterns[:5]}")
+                
+                # Look for form actions
+                form_actions = re.findall(r'action=["\']([^"\']*)["\']', html_content, re.IGNORECASE)
+                if form_actions:
+                    log.info(f"Found form actions: {form_actions[:5]}")
+                
+                # Try to find the actual game API by looking for common patterns
+                potential_endpoints = [
+                    f"{BASE_URL}/game/api/TrainPopulation",
+                    f"{BASE_URL}/game/api/train",
+                    f"{BASE_URL}/kingdom/api/TrainPopulation",
+                    f"{BASE_URL}/kingdom/api/train",
+                    f"{BASE_URL}/ajax/TrainPopulation",
+                    f"{BASE_URL}/ajax/train",
+                    f"{BASE_URL}/cmd/TrainPopulation",
+                    f"{BASE_URL}/cmd/train"
+                ]
+                
+                for endpoint in potential_endpoints:
+                    try:
+                        test_data = {
+                            "accountId": ACCOUNT_ID,
+                            "token": TOKEN,
+                            "kingdomId": KINGDOM_ID,
+                            "popTypeId": 17,
+                            "quantity": 0
+                        }
+                        
+                        r = await self.client.get(endpoint, params=test_data, timeout=HTTP_TIMEOUT)
+                        if r.status_code == 200:
+                            response_text = r.text
+                            if not (response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text):
+                                log.info(f"✅ Found working API endpoint: {endpoint}")
+                                log.info(f"Response: {response_text[:200]}...")
+                                return
+                            else:
+                                log.debug(f"❌ {endpoint} returned HTML")
+                        else:
+                            log.debug(f"❌ {endpoint} returned {r.status_code}")
+                            
+                    except Exception as e:
+                        log.debug(f"❌ {endpoint} failed: {e}")
+                        continue
+                
+                log.warning("No working API endpoints found in exploration")
+                
+        except Exception as e:
+            log.warning(f"API exploration failed: {e}")
+
     async def validate_credentials(self) -> bool:
         """Validate that our credentials work by trying a simple API call"""
         try:
@@ -911,6 +981,9 @@ async def main_async() -> None:
                         log.warning("Login failed, but continuing anyway - maybe the game doesn't require login")
                         # Don't break - continue with the operation anyway
                         # The game might work without proper login
+                
+                # Try to understand the game's API structure
+                await api.explore_game_api()
                 
                 if args.cmd == "train":
                     await run_train(
