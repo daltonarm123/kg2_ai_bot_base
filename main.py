@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-KG2 AI Bot - main.py (auto token refresh)
-- Detects auth failures and refreshes token automatically.
-- Refresh order:
-  (1) Form login via /Account/Login using KG2_USERNAME/KG2_PASSWORD
-  (2) Probe likely token endpoints and parse token
-  (3) Optional custom KG2_TOKEN_PROVIDER (returns {"token":"..."})
-- Retries the failed ASMX call once after refresh.
-- Retains: messages ("Pigeons"), early-game explore, research, capacity fixes,
-  tick-aware idle sleeps, SQLite "brain", warmups per referer.
+KG2 AI Bot - main.py (token capture from GetKingdomDetails)
+- Captures/updates token from successful ASMX responses (esp. GetKingdomDetails).
+- On auth failure, refresh flow:
+  (1) Form login to set cookies
+  (2) Call GetKingdomDetails; if response payload includes a token, store it
+  (3) Otherwise probe token endpoints (kept as fallback)
+  (4) Optional custom KG2_TOKEN_PROVIDER
+- Retries the failed call once after refresh.
+- Retains: early-game explore (peasant-aware), messages ("Pigeons"), research,
+  capacity fixes, tick-aware idle sleeping, SQLite brain, per-page warmups.
 """
 
 import os, sys, json, asyncio, logging, random, sqlite3, re
@@ -22,29 +23,26 @@ except Exception:
 import httpx
 from urllib.parse import urlsplit
 
-# ----------------------- Time helpers -----------------------
+# ---------------- Time helpers ----------------
 
 def local_now(tz_name: str = None) -> datetime:
     tz = None
     if tz_name and zoneinfo:
-        try:
-            tz = zoneinfo.ZoneInfo(tz_name)
-        except Exception:
-            tz = None
+        try: tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception: tz = None
     return datetime.now(tz or timezone.utc)
 
 def in_human_sleep_window(tz_name: str = "America/Chicago") -> bool:
-    now = local_now(tz_name); h = now.hour
+    h = local_now(tz_name).hour
     return 1 <= h < 6
 
 def minutes_until(minute_past_hour: int, tz_name: str) -> float:
     now = local_now(tz_name)
-    target = now.replace(minute=minute_past_hour, second=0, microsecond=0)
-    if target <= now:
-        target = target + timedelta(hours=1)
-    return (target - now).total_seconds() / 60.0
+    tgt = now.replace(minute=minute_past_hour, second=0, microsecond=0)
+    if tgt <= now: tgt = tgt + timedelta(hours=1)
+    return (tgt - now).total_seconds() / 60.0
 
-# ----------------------- Config -----------------------
+# ---------------- Config ----------------
 
 def env_bool(key: str, default: bool=False) -> bool:
     v = os.getenv(key)
@@ -67,7 +65,7 @@ class Config:
 
     username: str = os.getenv("KG2_USERNAME", "")
     password: str = os.getenv("KG2_PASSWORD", "")
-    token_provider: str = os.getenv("KG2_TOKEN_PROVIDER", "")  # optional webhook that returns {"token": "..."}
+    token_provider: str = os.getenv("KG2_TOKEN_PROVIDER", "")
 
     mock: bool = env_bool("KG2_MOCK", False)
     timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
@@ -80,12 +78,12 @@ class Config:
     messages_enabled: bool = env_bool("KG2_MESSAGES_ENABLED", True)
     auto_token: bool = env_bool("KG2_AUTO_TOKEN", True)
 
-# ----------------------- Logging -----------------------
+# ---------------- Logging ----------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("kg2bot")
 
-# ----------------------- SQLite Brain -----------------------
+# ---------------- SQLite Brain ----------------
 
 class Brain:
     def __init__(self, path="bot_memory.sqlite", tz="America/Chicago"):
@@ -119,8 +117,7 @@ class Brain:
         );
         """)
 
-    def _nowstr(self):
-        return local_now(self.tz).isoformat(timespec="seconds")
+    def _nowstr(self): return local_now(self.tz).isoformat(timespec="seconds")
 
     def log_explore(self, sent, result, land_before=None, land_after=None):
         self.conn.execute(
@@ -136,7 +133,7 @@ class Brain:
             (self._nowstr(), to_k, json.dumps(our_force or {}), str(result or ""), json.dumps(loot or {})))
     def log_spy(self, target, payload):
         self.conn.execute(
-            "INSERT INTO spy_reports(ts,target,payload_json) VALUES(?,?,?)",
+            "INSERT INTO spy_reports(ts,target,payload_json) VALUES(?, ?, ?)",
             (self._nowstr(), target, json.dumps(payload or {})))
     def log_gem(self, context, amount, note=""):
         self.conn.execute(
@@ -162,7 +159,7 @@ class Brain:
                     (f'-{int(hours)} hours',))
         return [row[0] for row in cur.fetchall()]
 
-# ----------------------- HTTP Client with Auto Token -----------------------
+# ---------------- HTTP client (auto token) ----------------
 
 class KG2Client:
     TROOP_ID = {
@@ -201,101 +198,124 @@ class KG2Client:
         except Exception as e:
             logging.warning("Warmup failed for %s: %s", referer_url, e)
 
+    # ---- token helpers ----
+    def _extract_token(self, data: Any) -> Optional[str]:
+        """Find a token in any JSON-shaped response."""
+        if isinstance(data, dict):
+            for k in ("token","authToken","Token"):
+                v = data.get(k)
+                if isinstance(v, str) and len(v) >= 16:
+                    return v
+            # Sometimes nested
+            for v in data.values():
+                t = self._extract_token(v)
+                if t: return t
+        elif isinstance(data, list):
+            for it in data:
+                t = self._extract_token(it)
+                if t: return t
+        elif isinstance(data, str):
+            # try to parse embedded JSON
+            try:
+                j = json.loads(data)
+                return self._extract_token(j)
+            except Exception:
+                pass
+        return None
+
     async def _try_token_provider(self) -> Optional[str]:
-        url = self.cfg.token_provider.strip()
+        url = (self.cfg.token_provider or "").strip()
         if not url: return None
         try:
             r = await self._client.get(url, timeout=15)
             if r.status_code == 200:
                 j = r.json()
-                tok = j.get("token") or j.get("Token") or j.get("authToken")
-                if tok: return str(tok)
+                tok = self._extract_token(j)
+                if tok: return tok
         except Exception as e:
             logging.info("Custom token provider failed: %s", e)
         return None
 
     async def _login_form(self) -> bool:
-        """Login via /Account/Login with antiforgery; returns True if cookies/session established."""
         if not (self.cfg.username and self.cfg.password):
             return False
         try:
-            # GET login page for anti-forgery token
             r = await self._client.get("/Account/Login", headers={"world-id": str(self.cfg.world_id)})
-            if r.status_code != 200:
-                logging.info("Login GET failed: %s", r.status_code)
-                return False
+            if r.status_code != 200: return False
             m = re.search(r'name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"', r.text, re.I)
-            token = m.group(1) if m else ""
-            form = {
-                "__RequestVerificationToken": token,
-                "Email": self.cfg.username,
-                "Password": self.cfg.password,
-                "RememberMe": "true",
-            }
-            hdrs = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": self.cfg.origin_url,
-                "Referer": self.cfg.origin_url + "/Account/Login",
-                "world-id": str(self.cfg.world_id),
-            }
+            vf = m.group(1) if m else ""
+            form = {"__RequestVerificationToken": vf, "Email": self.cfg.username, "Password": self.cfg.password, "RememberMe": "true"}
+            hdrs = {"Content-Type":"application/x-www-form-urlencoded","Origin": self.cfg.origin_url,
+                    "Referer": self.cfg.origin_url+"/Account/Login","world-id": str(self.cfg.world_id)}
             r2 = await self._client.post("/Account/Login", data=form, headers=hdrs)
-            if r2.status_code not in (200, 302):
-                logging.info("Login POST failed: %s", r2.status_code)
-                return False
-            # Warmup overview to finalize session
+            if r2.status_code not in (200,302): return False
             await self._warmup_for(self.cfg.referer_overview)
-            logging.info("Form login established (cookies present).")
+            logging.info("Form login established.")
             return True
         except Exception as e:
             logging.info("Form login error: %s", e)
             return False
 
     async def _probe_token_endpoints(self) -> Optional[str]:
-        """Try a list of likely endpoints to fetch a fresh token."""
+        # Fallback probes (kept, in case they exist)
         candidates = [
             ("/WebService/Accounts.asmx/GetAuthToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
             ("/WebService/Accounts.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
             ("/WebService/Accounts.asmx/GetLoginToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
-            ("/WebService/Account.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
-            ("/WebService/Users.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
         ]
         for path, body in candidates:
             try:
                 d = await self._post_raw(path, body, self.cfg.referer_overview)
-                # unwrap .d if needed
-                if isinstance(d, dict) and "d" in d:
-                    try: d = json.loads(d["d"])
-                    except Exception: d = d["d"]
-                if isinstance(d, dict):
-                    tok = d.get("token") or d.get("Token") or d.get("authToken")
-                    if tok: return str(tok)
+                # unwrap .d if present
+                j = d.json()
+                if isinstance(j, dict) and "d" in j:
+                    try: j = json.loads(j["d"])
+                    except Exception: j = j["d"]
+                tok = self._extract_token(j)
+                if tok: return tok
             except Exception:
                 continue
         return None
 
     async def refresh_token(self) -> bool:
-        """Main refresh flow; updates cfg.token if successful."""
+        """Refresh via: (A) custom provider, (B) login + GetKingdomDetails, (C) probe endpoints."""
         if not self.cfg.auto_token:
             return False
 
-        # 1) optional custom provider
+        # A) External provider
         tok = await self._try_token_provider()
         if tok:
             self.cfg.token = tok
-            logging.info("Token refreshed via custom provider.")
+            logging.info("Token refreshed via provider.")
             return True
 
-        # 2) Form login to establish cookies; may be required for token endpoints
+        # B) Login then GetKingdomDetails (token lives here per user)
         await self._login_form()
+        try:
+            # Try details even with empty/stale token; cookies may suffice.
+            body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+            r = await self._post_raw("/WebService/Kingdoms.asmx/GetKingdomDetails", body, self.cfg.referer_overview)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict) and "d" in j and isinstance(j["d"], str):
+                    try: j = json.loads(j["d"])
+                    except Exception: j = j["d"]
+                tok = self._extract_token(j)
+                if tok:
+                    self.cfg.token = tok
+                    logging.info("Token refreshed from GetKingdomDetails.")
+                    return True
+        except Exception as e:
+            logging.info("Details probe during refresh failed: %s", e)
 
-        # 3) Probe token endpoints
+        # C) Fallback probe endpoints
         tok = await self._probe_token_endpoints()
         if tok:
             self.cfg.token = tok
-            logging.info("Token refreshed via token endpoint.")
+            logging.info("Token refreshed via token endpoint probe.")
             return True
 
-        logging.warning("Auto token refresh failed (no token endpoint responded).")
+        logging.warning("Auto token refresh failed.")
         return False
 
     async def _post_raw(self, path: str, body: dict, referer: str) -> httpx.Response:
@@ -312,36 +332,46 @@ class KG2Client:
         return await self._client.post(path, json=body, headers=headers)
 
     async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
-        """POST once; on auth fail, attempt refresh+retry once."""
-        # First attempt
+        # Attempt #1
         resp = await self._post_raw(path, body, referer)
+
+        # If auth-like error, try to refresh then retry once
         if resp.status_code in (401,403) or (resp.status_code==500 and resp.headers.get("Content-Type","").startswith("text/html")):
             logging.error("Auth-ish failure %s on %s; attempting refresh...", resp.status_code, path)
             if await self.refresh_token():
-                # swap new token into body if expected
-                if "token" in body:
-                    body["token"] = self.cfg.token
-                # Retry once
+                if "token" in body: body["token"] = self.cfg.token
                 resp = await self._post_raw(path, body, referer)
-        # Final handling
+
+        # Still failing?
         if resp.status_code in (401,403):
-            tok = str(self.cfg.token)
-            tok_masked = tok[:6] + "..." + tok[-4:] if len(tok) > 10 else "***"
-            raise RuntimeError(
-                f"AUTH_FAIL {resp.status_code} at {path} | referer={referer} | world={self.cfg.world_id} "
-                f"| acct={self.cfg.account_id} | king={self.cfg.kingdom_id} | token={tok_masked}"
-            )
+            tok = str(self.cfg.token); tok_mask = tok[:6]+"..."+tok[-4:] if len(tok)>10 else "***"
+            raise RuntimeError(f"AUTH_FAIL {resp.status_code} at {path} | referer={referer} | world={self.cfg.world_id} | acct={self.cfg.account_id} | king={self.cfg.kingdom_id} | token={tok_mask}")
         if resp.status_code == 500 and resp.headers.get("Content-Type","").startswith("text/html"):
-            snippet = resp.text[:300].replace("\n"," ")
-            raise RuntimeError(f"AUTH_FAIL 500-HTML at {path}. Snip: {snippet}")
+            raise RuntimeError("AUTH_FAIL 500-HTML at %s" % path)
+
         resp.raise_for_status()
+
+        # Parse JSON and auto-capture rotated token if present
         data = resp.json()
         if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
-            try: return json.loads(data["d"])
-            except Exception: return data
+            try: parsed = json.loads(data["d"])
+            except Exception: parsed = data["d"]
+            # Token sniff
+            tok = self._extract_token(parsed)
+            if tok and tok != self.cfg.token:
+                self.cfg.token = tok
+                logging.info("Observed token rotation in response (%s). Stored new token.", path)
+            return parsed
+
+        # Token sniff in non-wrapped payloads, too
+        tok2 = self._extract_token(data)
+        if tok2 and tok2 != self.cfg.token:
+            self.cfg.token = tok2
+            logging.info("Observed token rotation in response (%s). Stored new token.", path)
+
         return data
 
-    # ---------- API wrappers ----------
+    # -------- API wrappers --------
     async def get_details(self) -> dict:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
         return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomDetails", b, self.cfg.referer_overview)
@@ -405,7 +435,7 @@ class KG2Client:
         per_msg_referer = f"https://www.kingdomgame.net/messages/message/{int(message_id)}"
         return await self.post_asmx("/WebService/Messages.asmx/GetMessage", b, per_msg_referer)
 
-# ----------------------- Normalizers -----------------------
+# ---------------- Normalizers ----------------
 
 @dataclass
 class KingdomState:
@@ -423,7 +453,7 @@ class KingdomState:
     season: str = ""
 
 def _normalize_resources(res_api: dict) -> Tuple[dict, dict, dict, dict]:
-    name_map = {"food":"food","gold":"gold","wood":"wood","stone":"stone","mana":"mana","land":"land","blue gems":"blue_gems"}
+    name_map = {"land":"land","food":"food","gold":"gold","stone":"stone","wood":"wood","mana":"mana","blue gems":"blue_gems"}
     resources, storage, prod, flags = {}, {}, {}, {"maintenance_issue_wood": False, "maintenance_issue_stone": False}
     for r in (res_api or {}).get("resources", []):
         n = (r.get("name") or "").lower().strip(); key = name_map.get(n)
@@ -434,12 +464,12 @@ def _normalize_resources(res_api: dict) -> Tuple[dict, dict, dict, dict]:
     for k in name_map.values(): resources.setdefault(k,0); storage.setdefault(k,0); prod.setdefault(k,0)
     return resources, storage, prod, flags
 
-def _normalize_population(pop_api: dict) -> Tuple[dict, dict, dict]:
+def _normalize_population(pjs: dict) -> Tuple[dict, dict, dict]:
     key_map = {"peasants":"peasants","footmen":"footmen","pikemen":"pikemen","archers":"archers","crossbowmen":"crossbow",
                "light cavalry":"light_cav","heavy cavalry":"heavy_cav","knights":"knights","elites":"elites",
                "spies":"spies","priests":"priests","diplomats":"diplomats","market wagons":"wagons"}
     units, inprog, returning = {}, {}, {}
-    for r in (pop_api or {}).get("population", []):
+    for r in (pjs or {}).get("population", []):
         name = (r.get("name") or "").lower().strip(); key = key_map.get(name)
         if not key: continue
         units[key] = int(r.get("amount", 0)); inprog[key]=int(r.get("amountInProgress",0)); returning[key]=int(r.get("amountReturning",0))
@@ -489,7 +519,7 @@ def normalize_training_skills(ts_json: dict) -> List[dict]:
         out.append({"id":str(rid) if rid is not None else "","name":name,"eta":remaining,"targetLevel":level_to})
     return out
 
-# ----------------------- Bot -----------------------
+# ---------------- Bot ----------------
 
 class Bot:
     def __init__(self, cfg: Config):
@@ -518,7 +548,7 @@ class Bot:
         if self._explore_back_at and now >= self._explore_back_at:
             self._explore_back_at = None
 
-        st = KingdomState(
+        return KingdomState(
             id=int(kd.get("id", 0)), name=kd.get("name",""),
             tax_rate=int(kd.get("taxRate",24)), land=int(kd.get("land", resources.get("land",0))),
             resources={"food":resources["food"],"wood":resources["wood"],"stone":resources["stone"],"gold":resources["gold"]},
@@ -533,7 +563,6 @@ class Bot:
                     "maintenance_flags": flags},
             season=(kd.get("seasonName") or "").strip(),
         )
-        return st
 
     def is_early_game(self, st: KingdomState) -> bool:
         return st.land < 5000 or sum(st.buildings.values()) < 200
@@ -639,33 +668,25 @@ class Bot:
         return res.get("ReturnString", f"Research queued: {name}")
 
     def _parse_message_actions(self, subject: str, body: str) -> List[Tuple[str, Any]]:
-        s = (subject or "").lower()
-        b = (body or "").lower()
+        s = (subject or "").lower(); b = (body or "").lower()
         actions: List[Tuple[str, Any]] = []
 
-        if "tutorial 1" in s and "explore" in (s+b):
-            actions.append(("explore_hint", None))
-        if "tutorial 2" in s and "gems" in s:
-            actions.append(("note", "tutorial_gems_info"))
-        if "completed quest" in s:
-            actions.append(("note", "quest_completed"))
-        if "spy report" in s:
-            actions.append(("note", "log_spy_report"))
-        if "attack report" in s:
-            actions.append(("note", "log_attack_report"))
+        if "tutorial 1" in s and "explore" in (s+b): actions.append(("explore_hint", None))
+        if "tutorial 2" in s and "gems" in s: actions.append(("note", "tutorial_gems_info"))
+        if "completed quest" in s: actions.append(("note", "quest_completed"))
+        if "spy report" in s: actions.append(("note", "log_spy_report"))
+        if "attack report" in s: actions.append(("note", "log_attack_report"))
 
         m = re.search(r"set\s+tax\s+to\s+(\d+)", b)
-        if m:
-            rate = max(0, min(26, int(m.group(1))))
-            actions.append(("set_tax", rate))
+        if m: actions.append(("set_tax", max(0, min(26, int(m.group(1))))))
 
-        if any(k in b for k in ("build farm", "grain farm", "more food", "run out of food")):
+        if any(k in b for k in ("build farm","grain farm","more food","run out of food")):
             actions.append(("build", {"typeId":"2","qty":1}))
-        if any(k in b for k in ("build barracks", "train footmen")):
+        if any(k in b for k in ("build barracks","train footmen")):
             actions.append(("build", {"typeId":"16","qty":1}))
-        if any(k in b for k in ("build lumber", "wood storage", "wood cap")):
+        if any(k in b for k in ("build lumber","wood storage","wood cap")):
             actions.append(("build", {"typeId":"9","qty":1}))
-        if any(k in b for k in ("build quarry", "stone storage", "stone cap")):
+        if any(k in b for k in ("build quarry","stone storage","stone cap")):
             actions.append(("build", {"typeId":"6","qty":1}))
         if "build barn" in b:
             actions.append(("build", {"typeId":"22","qty":1}))
@@ -674,26 +695,19 @@ class Bot:
             actions.append(("explore_hint", None))
 
         if "research" in b:
-            if "farming" in b or "food" in b:
-                actions.append(("research_hint", "Better Farming Methods"))
-            elif "engineering" in b or "build faster" in b:
-                actions.append(("research_hint", "Engineering"))
-            elif "mathematics" in b or "tax" in b:
-                actions.append(("research_hint", "Mathematics"))
+            if "farming" in b or "food" in b: actions.append(("research_hint","Better Farming Methods"))
+            elif "engineering" in b or "build faster" in b: actions.append(("research_hint","Engineering"))
+            elif "mathematics" in b or "tax" in b: actions.append(("research_hint","Mathematics"))
 
-        if "train footmen" in b:
-            actions.append(("train_hint", "footmen"))
-        if "train spies" in b or "build spies" in b:
-            actions.append(("train_hint", "spies"))
-
+        if "train footmen" in b: actions.append(("train_hint","footmen"))
+        if "train spies" in b or "build spies" in b: actions.append(("train_hint","spies"))
         return actions
 
     async def process_messages(self, st: KingdomState):
-        if not self.cfg.messages_enabled:
-            return
+        if not self.cfg.messages_enabled: return
         inbox = await self.client.get_messages_list()
         rows = inbox.get("messages") or inbox.get("items") or inbox.get("inbox") or []
-        msgs = []
+        msgs=[]
         for r in rows:
             mid = r.get("id") or r.get("messageId") or r.get("Id")
             if not mid: continue
@@ -701,32 +715,29 @@ class Bot:
             sender  = r.get("from") or r.get("sender") or r.get("From") or "System"
             is_read = bool(r.get("isRead") or r.get("read") or r.get("IsRead") or False)
             msgs.append((int(mid), subject, sender, is_read))
-
-        pri = []
+        pri=[]
         for mid, sub, snd, read in msgs:
             score = (0 if not read else 10)
             if (sub or "").lower().startswith(("tutorial","completed quest")): score -= 5
-            if (snd or "").lower() == "system": score -= 1
+            if (snd or "").lower()=="system": score -= 1
             pri.append((score, mid, sub, snd, read))
         pri.sort()
         to_open = [(mid, sub, snd) for _, mid, sub, snd, _ in pri[:5]]
 
-        acted_any = False
+        acted_any=False
         for mid, sub, snd in to_open:
             try:
                 m = await self.client.get_message(int(mid))
             except Exception as e:
                 self.logger.warning("GetMessage failed for %s: %s", mid, e)
                 continue
-
             body = m.get("body") or m.get("Body") or m.get("messageBody") or m.get("MessageBody") or ""
             subject = m.get("subject") or m.get("Subject") or sub or ""
             sender  = m.get("from") or m.get("sender") or m.get("From") or snd or ""
             self.brain.log_message(message_id=int(mid), subject=subject, sender=sender, body=body)
             self.logger.info("MESSAGE [%s] %s | from=%s", mid, subject, sender)
 
-            actions = self._parse_message_actions(subject, body)
-            for kind, payload in actions:
+            for kind, payload in self._parse_message_actions(subject, body):
                 if kind == "set_tax":
                     self.logger.info("MSG ACTION: would set tax to %s (endpoint TBD)", payload)
                 elif kind == "build":
@@ -738,8 +749,7 @@ class Bot:
                     except Exception as e:
                         self.logger.info("MSG ACTION: build %s failed: %s", type_id, e)
                 elif kind == "explore_hint":
-                    msg = await self.plan_exploration(st)
-                    self.logger.info("MSG ACTION: %s", msg); acted_any = True
+                    msg = await self.plan_exploration(st); self.logger.info("MSG ACTION: %s", msg); acted_any=True
                 elif kind == "research_hint":
                     skills = st.research.get("skills") or []
                     sid = self._find_skill_id(skills, payload)
@@ -747,15 +757,8 @@ class Bot:
                         res = await self.client.train_skill(sid)
                         self.logger.info("MSG ACTION: research %s -> %s", payload, res.get("ReturnString","OK"))
                         acted_any = True
-                    else:
-                        self.logger.info("MSG ACTION: research hint %s not available", payload)
                 elif kind == "train_hint":
                     self.logger.info("MSG ACTION: would train %s (endpoint TBD)", payload)
-                elif kind == "note":
-                    self.logger.info("MSG NOTE: %s", payload)
-            if actions:
-                self.brain.mark_message_acted(int(mid))
-
         if acted_any:
             self.logger.info("Finished processing messages with actions.")
         elif to_open:
@@ -766,21 +769,17 @@ class Bot:
         mins_to_tick = minutes_until(self.cfg.tick_minute, tz)
         if 2 <= mins_to_tick <= 7:
             return max(2.0, mins_to_tick + random.uniform(-1, 1))
-
         if st.queues.get("building_busy") or st.queues.get("training_busy") or st.queues.get("explore_busy"):
             base = random.uniform(3, 12)
             if in_human_sleep_window(tz): base = random.uniform(8, 18)
             return base
-
         near_cap_wood  = st.storage["wood"]  > 0 and st.resources["wood"]  >= st.storage["wood"]  * 0.95
         near_cap_stone = st.storage["stone"] > 0 and st.resources["stone"] >= st.storage["stone"] * 0.95
         if near_cap_wood or near_cap_stone: return random.uniform(4, 8)
-
         gold_hr = max(0, st.prod_per_hour.get("gold",0))
         target_gold = max(6000, min(20000, st.resources["gold"]+8000))
         gold_deficit = max(0, target_gold - st.resources["gold"])
         wait_for_gold = (gold_deficit / gold_hr * 60) if gold_hr>0 else 15.0
-
         if in_human_sleep_window(tz):
             return max(12.0, min(45.0, wait_for_gold + random.uniform(-3,6)))
         else:
@@ -789,18 +788,14 @@ class Bot:
     async def step(self) -> None:
         st = await self.fetch_state()
         self.logger.info("Strategy: economic + adaptive | land=%s", st.land)
-
         if st.resources["wood"] >= st.storage["wood"]:
             self.logger.warning("Wood over-capacity: %s/%s - need more lumber", st.resources["wood"], st.storage["wood"])
         if st.resources["stone"] >= st.storage["stone"]:
             self.logger.warning("Stone over-capacity: %s/%s - need more quarries", st.resources["stone"], st.storage["stone"])
-
         self.brain.log_tick(self.cfg.tick_minute)
 
-        try:
-            await self.process_messages(st)
-        except Exception as e:
-            self.logger.warning("Message processing error: %s", e)
+        try: await self.process_messages(st)
+        except Exception as e: self.logger.warning("Message processing error: %s", e)
 
         if self.is_early_game(st):
             idl = self.idle_units(st)
@@ -827,10 +822,8 @@ class Bot:
         self.logger.info("Mode: %s", "Mock" if self.cfg.mock else "Live")
         self.logger.info("Kingdom ID: %s", self.cfg.kingdom_id)
         if not self.cfg.mock:
-            try:
-                await self.client._warmup_for(self.cfg.referer_overview)
-            except Exception:
-                pass
+            try: await self.client._warmup_for(self.cfg.referer_overview)
+            except Exception: pass
         self.logger.info("Starting main bot loop...")
         try:
             while True:
@@ -842,15 +835,15 @@ class Bot:
         finally:
             await self.client.close()
 
-# ----------------------- Entrypoint -----------------------
+# --------------- Entrypoint ---------------
 
 if __name__ == "__main__":
     cfg = Config()
     if not cfg.mock and (not cfg.account_id or not cfg.kingdom_id):
         logger.error("Missing KG2_ACCOUNT_ID / KG2_KINGDOM_ID. Set KG2_MOCK=true to run sim.")
         sys.exit(1)
-    # Token can now be empty at startup if KG2_USERNAME/PASSWORD are set.
-    if not cfg.mock and not cfg.token and not (cfg.username and cfg.password):
+    # You can now leave KG2_TOKEN blank if KG2_USERNAME/PASSWORD are provided (auto refresh).
+    if not cfg.mock and not (cfg.token or (cfg.username and cfg.password)):
         logger.error("Provide KG2_TOKEN or KG2_USERNAME/KG2_PASSWORD for auto-refresh.")
         sys.exit(1)
     asyncio.run(Bot(cfg).run())
