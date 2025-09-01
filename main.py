@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-KG2 AI Bot - main.py (token capture from GetKingdomDetails)
-- Captures/updates token from successful ASMX responses (esp. GetKingdomDetails).
-- On auth failure, refresh flow:
-  (1) Form login to set cookies
-  (2) Call GetKingdomDetails; if response payload includes a token, store it
-  (3) Otherwise probe token endpoints (kept as fallback)
-  (4) Optional custom KG2_TOKEN_PROVIDER
-- Retries the failed call once after refresh.
-- Retains: early-game explore (peasant-aware), messages ("Pigeons"), research,
-  capacity fixes, tick-aware idle sleeping, SQLite brain, per-page warmups.
+KG2 AI Bot - hardened login + ASMX
+- Browser-grade headers (sec-*, ch-ua), per-page Referers, world-id
+- Anti-forgery login (__RequestVerificationToken) sent in form AND RequestVerificationToken header
+- Optional bootstrap cookie via KG2_SESSION_COOKIE
+- Token auto-capture (GetKingdomDetails), adaptive explore, messages, research, sleep, SQLite brain
 """
 
 import os, sys, json, asyncio, logging, random, sqlite3, re
@@ -21,9 +16,10 @@ try:
 except Exception:
     zoneinfo = None
 import httpx
+from httpx import Cookies
 from urllib.parse import urlsplit
 
-# ---------------- Time helpers ----------------
+# ---------------- time helpers ----------------
 
 def local_now(tz_name: str = None) -> datetime:
     tz = None
@@ -42,7 +38,7 @@ def minutes_until(minute_past_hour: int, tz_name: str) -> float:
     if tgt <= now: tgt = tgt + timedelta(hours=1)
     return (tgt - now).total_seconds() / 60.0
 
-# ---------------- Config ----------------
+# ---------------- config ----------------
 
 def env_bool(key: str, default: bool=False) -> bool:
     v = os.getenv(key)
@@ -54,8 +50,12 @@ class Config:
     base_url: str = os.getenv("KG2_BASE_URL", "https://www.kingdomgame.net")
     world_id: str = os.getenv("KG2_WORLD_ID", "1")
     account_id: str = os.getenv("KG2_ACCOUNT_ID", "")
-    token: str = os.getenv("KG2_TOKEN", "")
     kingdom_id: int = int(os.getenv("KG2_KINGDOM_ID", "0"))
+
+    token: str = os.getenv("KG2_TOKEN", "")
+    username: str = os.getenv("KG2_USERNAME", "")
+    password: str = os.getenv("KG2_PASSWORD", "")
+    token_provider: str = os.getenv("KG2_TOKEN_PROVIDER", "")
 
     referer_overview: str = os.getenv("KG2_REFERER_OVERVIEW", "https://www.kingdomgame.net/overview")
     referer_buildings: str = os.getenv("KG2_REFERER_BUILDINGS", "https://www.kingdomgame.net/buildings")
@@ -63,12 +63,6 @@ class Config:
     referer_research: str = os.getenv("KG2_REFERER_RESEARCH", "https://www.kingdomgame.net/research")
     referer_messages: str = os.getenv("KG2_REFERER_MESSAGES", "https://www.kingdomgame.net/messages")
 
-    username: str = os.getenv("KG2_USERNAME", "")
-    password: str = os.getenv("KG2_PASSWORD", "")
-    token_provider: str = os.getenv("KG2_TOKEN_PROVIDER", "")
-
-    mock: bool = env_bool("KG2_MOCK", False)
-    timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
     origin_url: str = "https://www.kingdomgame.net"
     tz_name: str = os.getenv("KG2_TZ", "America/Chicago")
 
@@ -77,13 +71,18 @@ class Config:
     threat_window_hrs: int = int(os.getenv("KG2_THREAT_WINDOW_HRS", "48"))
     messages_enabled: bool = env_bool("KG2_MESSAGES_ENABLED", True)
     auto_token: bool = env_bool("KG2_AUTO_TOKEN", True)
+    use_browser_headers: bool = env_bool("KG2_USE_BROWSER_HEADERS", True)
 
-# ---------------- Logging ----------------
+    bootstrap_cookie: str = os.getenv("KG2_SESSION_COOKIE", "")  # paste from browser if needed
+    timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
+    mock: bool = env_bool("KG2_MOCK", False)
+
+# ---------------- logging ----------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("kg2bot")
 
-# ---------------- SQLite Brain ----------------
+# ---------------- sqlite brain ----------------
 
 class Brain:
     def __init__(self, path="bot_memory.sqlite", tz="America/Chicago"):
@@ -118,48 +117,43 @@ class Brain:
         """)
 
     def _nowstr(self): return local_now(self.tz).isoformat(timespec="seconds")
-
     def log_explore(self, sent, result, land_before=None, land_after=None):
         self.conn.execute(
             "INSERT INTO events_explore(ts,sent_json,result,land_before,land_after) VALUES(?,?,?,?,?)",
             (self._nowstr(), json.dumps(sent), str(result), land_before, land_after))
-    def log_attack_in(self, from_k, ap_est=None, comp=None, result=None):
-        self.conn.execute(
-            "INSERT INTO events_attack_in(ts,from_kingdom,ap_est,comp_json,result) VALUES(?,?,?,?,?)",
-            (self._nowstr(), from_k, ap_est, json.dumps(comp or {}), str(result or "")))
-    def log_attack_out(self, to_k, our_force=None, result=None, loot=None):
-        self.conn.execute(
-            "INSERT INTO events_attack_out(ts,to_kingdom,our_force_json,result,loot_json) VALUES(?,?,?,?,?)",
-            (self._nowstr(), to_k, json.dumps(our_force or {}), str(result or ""), json.dumps(loot or {})))
-    def log_spy(self, target, payload):
-        self.conn.execute(
-            "INSERT INTO spy_reports(ts,target,payload_json) VALUES(?, ?, ?)",
-            (self._nowstr(), target, json.dumps(payload or {})))
-    def log_gem(self, context, amount, note=""):
-        self.conn.execute(
-            "INSERT INTO gem_usage(ts,context,amount,note) VALUES(?,?,?,?)",
-            (self._nowstr(), str(context), int(amount or 0), str(note or "")))
-    def log_tick(self, minute):
-        self.conn.execute("INSERT INTO tick_log(ts,minute) VALUES(?,?)", (self._nowstr(), int(minute)))
     def log_message(self, message_id: int, subject: str, sender: str, body: str):
         self.conn.execute(
             "INSERT INTO messages(ts,message_id,subject,sender,body,acted) VALUES(?,?,?,?,?,0)",
             (self._nowstr(), int(message_id), subject or "", sender or "", body or ""))
-    def mark_message_acted(self, message_id: int):
-        self.conn.execute("UPDATE messages SET acted=1 WHERE message_id=?", (int(message_id),))
+
     def recent_threat_score(self, hours=48) -> float:
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM events_attack_in WHERE ts >= datetime('now', ?)",
                     (f'-{int(hours)} hours',))
         hits = cur.fetchone()[0] or 0
         return min(10.0, (hits / 24.0) * 10.0)
-    def recent_spy_targets(self, hours=24) -> List[int]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT DISTINCT target FROM spy_reports WHERE ts >= datetime('now', ?)",
-                    (f'-{int(hours)} hours',))
-        return [row[0] for row in cur.fetchall()]
 
-# ---------------- HTTP client (auto token) ----------------
+# ---------------- http client ----------------
+
+BROWSER_HEADERS = {
+    # mirror a realistic Chromium/Edge header set
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    # client hints & fetch metadata
+    "sec-ch-ua": '"Not;A=Brand";v="99", "Microsoft Edge";v="139", "Chromium";v="139"',
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+HTML_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
 class KG2Client:
     TROOP_ID = {
@@ -169,17 +163,30 @@ class KG2Client:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
+        # cookie jar (optionally seed from env)
+        cookies = Cookies()
+        if cfg.bootstrap_cookie:
+            # parse "k=v; k2=v2"
+            for part in cfg.bootstrap_cookie.split(";"):
+                part = part.strip()
+                if not part or "=" not in part: continue
+                k, v = part.split("=", 1)
+                cookies.set(k.strip(), v.strip(), domain=urlsplit(cfg.base_url).hostname)
+
+        default_headers = (BROWSER_HEADERS if cfg.use_browser_headers else {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache", "Pragma": "no-cache",
+        })
+
         self._client = httpx.AsyncClient(
             base_url=self.cfg.base_url,
             follow_redirects=True,
             timeout=self.cfg.timeout_s,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
+            headers=default_headers,
+            cookies=cookies,
         )
 
     async def close(self): await self._client.aclose()
@@ -188,25 +195,29 @@ class KG2Client:
         try:
             path = urlsplit(referer_url).path or "/"
             headers = {
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept": HTML_ACCEPT,
                 "Referer": self.cfg.origin_url + "/",
                 "Origin": self.cfg.origin_url,
                 "world-id": str(self.cfg.world_id),
             }
+            if self.cfg.use_browser_headers:
+                headers.update({
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-dest": "document",
+                })
             r = await self._client.get(path, headers=headers)
             logging.info("Warmup GET %s -> %s", path, r.status_code)
         except Exception as e:
             logging.warning("Warmup failed for %s: %s", referer_url, e)
 
-    # ---- token helpers ----
+    # -------- token sniff --------
     def _extract_token(self, data: Any) -> Optional[str]:
-        """Find a token in any JSON-shaped response."""
         if isinstance(data, dict):
             for k in ("token","authToken","Token"):
                 v = data.get(k)
                 if isinstance(v, str) and len(v) >= 16:
                     return v
-            # Sometimes nested
             for v in data.values():
                 t = self._extract_token(v)
                 if t: return t
@@ -215,7 +226,6 @@ class KG2Client:
                 t = self._extract_token(it)
                 if t: return t
         elif isinstance(data, str):
-            # try to parse embedded JSON
             try:
                 j = json.loads(data)
                 return self._extract_token(j)
@@ -223,32 +233,45 @@ class KG2Client:
                 pass
         return None
 
-    async def _try_token_provider(self) -> Optional[str]:
-        url = (self.cfg.token_provider or "").strip()
-        if not url: return None
-        try:
-            r = await self._client.get(url, timeout=15)
-            if r.status_code == 200:
-                j = r.json()
-                tok = self._extract_token(j)
-                if tok: return tok
-        except Exception as e:
-            logging.info("Custom token provider failed: %s", e)
-        return None
-
+    # -------- login & refresh --------
     async def _login_form(self) -> bool:
         if not (self.cfg.username and self.cfg.password):
             return False
         try:
-            r = await self._client.get("/Account/Login", headers={"world-id": str(self.cfg.world_id)})
-            if r.status_code != 200: return False
-            m = re.search(r'name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"', r.text, re.I)
+            # GET login to get anti-forgery token + cookie
+            lg_get = await self._client.get("/Account/Login", headers={
+                "Accept": HTML_ACCEPT, "world-id": str(self.cfg.world_id),
+                "Referer": self.cfg.origin_url + "/", "Origin": self.cfg.origin_url,
+                "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document",
+            })
+            if lg_get.status_code != 200:
+                logging.info("Login GET unexpected: %s", lg_get.status_code); return False
+            m = re.search(r'name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"', lg_get.text, re.I)
             vf = m.group(1) if m else ""
-            form = {"__RequestVerificationToken": vf, "Email": self.cfg.username, "Password": self.cfg.password, "RememberMe": "true"}
-            hdrs = {"Content-Type":"application/x-www-form-urlencoded","Origin": self.cfg.origin_url,
-                    "Referer": self.cfg.origin_url+"/Account/Login","world-id": str(self.cfg.world_id)}
-            r2 = await self._client.post("/Account/Login", data=form, headers=hdrs)
-            if r2.status_code not in (200,302): return False
+            if not vf:
+                logging.info("Anti-forgery token not found on login page."); return False
+
+            form = {
+                "__RequestVerificationToken": vf,
+                "Email": self.cfg.username,
+                "Password": self.cfg.password,
+                "RememberMe": "true",
+            }
+            hdrs = {
+                "Content-Type":"application/x-www-form-urlencoded",
+                "Origin": self.cfg.origin_url,
+                "Referer": self.cfg.origin_url + "/Account/Login",
+                "world-id": str(self.cfg.world_id),
+                # send token also as header (ASP.NET AJAX convention)
+                "RequestVerificationToken": vf,
+                # mimic navigation post
+                "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document",
+            }
+            lg_post = await self._client.post("/Account/Login", data=form, headers=hdrs)
+            if lg_post.status_code not in (200, 302):
+                logging.info("Login POST failed: %s", lg_post.status_code); return False
+
+            # hit overview to finalize cookies
             await self._warmup_for(self.cfg.referer_overview)
             logging.info("Form login established.")
             return True
@@ -256,45 +279,13 @@ class KG2Client:
             logging.info("Form login error: %s", e)
             return False
 
-    async def _probe_token_endpoints(self) -> Optional[str]:
-        # Fallback probes (kept, in case they exist)
-        candidates = [
-            ("/WebService/Accounts.asmx/GetAuthToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
-            ("/WebService/Accounts.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
-            ("/WebService/Accounts.asmx/GetLoginToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
-        ]
-        for path, body in candidates:
-            try:
-                d = await self._post_raw(path, body, self.cfg.referer_overview)
-                # unwrap .d if present
-                j = d.json()
-                if isinstance(j, dict) and "d" in j:
-                    try: j = json.loads(j["d"])
-                    except Exception: j = j["d"]
-                tok = self._extract_token(j)
-                if tok: return tok
-            except Exception:
-                continue
-        return None
-
     async def refresh_token(self) -> bool:
-        """Refresh via: (A) custom provider, (B) login + GetKingdomDetails, (C) probe endpoints."""
-        if not self.cfg.auto_token:
+        # Try login, then GetKingdomDetails to harvest token
+        if not await self._login_form():
             return False
-
-        # A) External provider
-        tok = await self._try_token_provider()
-        if tok:
-            self.cfg.token = tok
-            logging.info("Token refreshed via provider.")
-            return True
-
-        # B) Login then GetKingdomDetails (token lives here per user)
-        await self._login_form()
         try:
-            # Try details even with empty/stale token; cookies may suffice.
-            body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-            r = await self._post_raw("/WebService/Kingdoms.asmx/GetKingdomDetails", body, self.cfg.referer_overview)
+            b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+            r = await self._post_raw("/WebService/Kingdoms.asmx/GetKingdomDetails", b, self.cfg.referer_overview)
             if r.status_code == 200:
                 j = r.json()
                 if isinstance(j, dict) and "d" in j and isinstance(j["d"], str):
@@ -306,69 +297,68 @@ class KG2Client:
                     logging.info("Token refreshed from GetKingdomDetails.")
                     return True
         except Exception as e:
-            logging.info("Details probe during refresh failed: %s", e)
-
-        # C) Fallback probe endpoints
-        tok = await self._probe_token_endpoints()
-        if tok:
-            self.cfg.token = tok
-            logging.info("Token refreshed via token endpoint probe.")
-            return True
-
-        logging.warning("Auto token refresh failed.")
+            logging.info("Refresh details call failed: %s", e)
         return False
 
-    async def _post_raw(self, path: str, body: dict, referer: str) -> httpx.Response:
-        await self._warmup_for(referer)
-        headers = {
+    # -------- ASMX POST --------
+    def _asmx_headers(self, referer: str) -> Dict[str, str]:
+        h = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "world-id": str(self.cfg.world_id),
             "Origin": self.cfg.origin_url,
             "Referer": referer,
             "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": self._client.headers.get("User-Agent"),
         }
-        return await self._client.post(path, json=body, headers=headers)
+        if self.cfg.use_browser_headers:
+            h.update({
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "sec-ch-ua": BROWSER_HEADERS["sec-ch-ua"],
+                "sec-ch-ua-platform": BROWSER_HEADERS["sec-ch-ua-platform"],
+                "sec-ch-ua-mobile": BROWSER_HEADERS["sec-ch-ua-mobile"],
+            })
+        return h
+
+    async def _post_raw(self, path: str, body: dict, referer: str) -> httpx.Response:
+        await self._warmup_for(referer)
+        return await self._client.post(path, json=body, headers=self._asmx_headers(referer))
 
     async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
-        # Attempt #1
         resp = await self._post_raw(path, body, referer)
 
-        # If auth-like error, try to refresh then retry once
-        if resp.status_code in (401,403) or (resp.status_code==500 and resp.headers.get("Content-Type","").startswith("text/html")):
+        # handle auth-ish failures
+        html_500 = (resp.status_code == 500 and resp.headers.get("Content-Type","").startswith("text/html"))
+        if resp.status_code in (401,403) or html_500:
             logging.error("Auth-ish failure %s on %s; attempting refresh...", resp.status_code, path)
             if await self.refresh_token():
                 if "token" in body: body["token"] = self.cfg.token
                 resp = await self._post_raw(path, body, referer)
 
-        # Still failing?
         if resp.status_code in (401,403):
-            tok = str(self.cfg.token); tok_mask = tok[:6]+"..."+tok[-4:] if len(tok)>10 else "***"
-            raise RuntimeError(f"AUTH_FAIL {resp.status_code} at {path} | referer={referer} | world={self.cfg.world_id} | acct={self.cfg.account_id} | king={self.cfg.kingdom_id} | token={tok_mask}")
+            raise RuntimeError(f"AUTH_FAIL {resp.status_code} at {path} | referer={referer} | world={self.cfg.world_id} "
+                               f"| acct={self.cfg.account_id} | king={self.cfg.kingdom_id} | token=***")
         if resp.status_code == 500 and resp.headers.get("Content-Type","").startswith("text/html"):
             raise RuntimeError("AUTH_FAIL 500-HTML at %s" % path)
 
         resp.raise_for_status()
-
-        # Parse JSON and auto-capture rotated token if present
         data = resp.json()
+
+        # unwrap .d and sniff tokens
         if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
             try: parsed = json.loads(data["d"])
             except Exception: parsed = data["d"]
-            # Token sniff
             tok = self._extract_token(parsed)
             if tok and tok != self.cfg.token:
                 self.cfg.token = tok
-                logging.info("Observed token rotation in response (%s). Stored new token.", path)
+                logging.info("Observed token rotation (%s). Stored new token.", path)
             return parsed
 
-        # Token sniff in non-wrapped payloads, too
         tok2 = self._extract_token(data)
         if tok2 and tok2 != self.cfg.token:
             self.cfg.token = tok2
-            logging.info("Observed token rotation in response (%s). Stored new token.", path)
-
+            logging.info("Observed token rotation (%s). Stored new token.", path)
         return data
 
     # -------- API wrappers --------
@@ -413,12 +403,11 @@ class KG2Client:
         for path, body in attempts:
             try:
                 d = await self.post_asmx(path, body, referer)
-                if d.get("ReturnValue") == 1 or d.get("success"):
-                    return d
+                if d.get("ReturnValue") == 1 or d.get("success"): return d
                 if "ReturnString" in d: return d
             except Exception:
                 continue
-        return {"ReturnValue":0,"ReturnString":"No research train endpoint accepted the request"}
+        return {"ReturnValue":0,"ReturnString":"No research endpoint accepted the request"}
 
     async def explore(self, troops_array: List[dict]) -> dict:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
@@ -435,7 +424,7 @@ class KG2Client:
         per_msg_referer = f"https://www.kingdomgame.net/messages/message/{int(message_id)}"
         return await self.post_asmx("/WebService/Messages.asmx/GetMessage", b, per_msg_referer)
 
-# ---------------- Normalizers ----------------
+# ---------------- state normalization ----------------
 
 @dataclass
 class KingdomState:
@@ -452,19 +441,21 @@ class KingdomState:
     queues: Dict[str, Any] = field(default_factory=dict)
     season: str = ""
 
-def _normalize_resources(res_api: dict) -> Tuple[dict, dict, dict, dict]:
+def _normalize_resources(rjs: dict):
     name_map = {"land":"land","food":"food","gold":"gold","stone":"stone","wood":"wood","mana":"mana","blue gems":"blue_gems"}
     resources, storage, prod, flags = {}, {}, {}, {"maintenance_issue_wood": False, "maintenance_issue_stone": False}
-    for r in (res_api or {}).get("resources", []):
+    for r in (rjs or {}).get("resources", []):
         n = (r.get("name") or "").lower().strip(); key = name_map.get(n)
         if not key: continue
-        resources[key] = int(r.get("amount", 0)); storage[key] = int(r.get("capacity", 0)); prod[key] = int(r.get("productionPerHour", 0))
+        resources[key] = int(r.get("amount", 0))
+        storage[key] = int(r.get("capacity", 0))
+        prod[key] = int(r.get("productionPerHour", 0))
         if n=="wood" and r.get("maintenanceIssue"): flags["maintenance_issue_wood"]=True
         if n=="stone" and r.get("maintenanceIssue"): flags["maintenance_issue_stone"]=True
     for k in name_map.values(): resources.setdefault(k,0); storage.setdefault(k,0); prod.setdefault(k,0)
     return resources, storage, prod, flags
 
-def _normalize_population(pjs: dict) -> Tuple[dict, dict, dict]:
+def _normalize_population(pjs: dict):
     key_map = {"peasants":"peasants","footmen":"footmen","pikemen":"pikemen","archers":"archers","crossbowmen":"crossbow",
                "light cavalry":"light_cav","heavy cavalry":"heavy_cav","knights":"knights","elites":"elites",
                "spies":"spies","priests":"priests","diplomats":"diplomats","market wagons":"wagons"}
@@ -472,19 +463,23 @@ def _normalize_population(pjs: dict) -> Tuple[dict, dict, dict]:
     for r in (pjs or {}).get("population", []):
         name = (r.get("name") or "").lower().strip(); key = key_map.get(name)
         if not key: continue
-        units[key] = int(r.get("amount", 0)); inprog[key]=int(r.get("amountInProgress",0)); returning[key]=int(r.get("amountReturning",0))
+        units[key] = int(r.get("amount", 0))
+        inprog[key]=int(r.get("amountInProgress",0))
+        returning[key]=int(r.get("amountReturning",0))
     for k in key_map.values(): units.setdefault(k,0); inprog.setdefault(k,0); returning.setdefault(k,0)
     return units, inprog, returning
 
-def _normalize_buildings(b_api: dict) -> Tuple[dict, dict, dict]:
+def _normalize_buildings(bjs: dict):
     map_name = {"houses":"houses","grain farms":"farms","lumber yards":"lumber","stone quarries":"quarries","barracks":"barracks",
                 "stables":"stables","archery ranges":"archery","guildhalls":"guild","temples":"temples","markets":"markets",
                 "barns":"barns","castles":"castles","horse farms":"horse_farms"}
     buildings, inprog, canb = {}, {}, {}
-    for r in (b_api or {}).get("buildings", []):
+    for r in (bjs or {}).get("buildings", []):
         name = (r.get("name") or "").lower().strip(); key = map_name.get(name)
         if not key: continue
-        buildings[key]=int(r.get("amount",0)); inprog[key]=int(r.get("amountInProgress",0)); canb[key]=bool(r.get("canBuild",False))
+        buildings[key]=int(r.get("amount",0))
+        inprog[key]=int(r.get("amountInProgress",0))
+        canb[key]=bool(r.get("canBuild",False))
     for k in ("houses","farms","lumber","quarries","barracks","stables","archery","barns","markets","temples","castles"):
         buildings.setdefault(k,0); inprog.setdefault(k,0); canb.setdefault(k,True)
     return buildings, inprog, canb
@@ -495,17 +490,11 @@ def normalize_skills(sk_json: dict) -> List[dict]:
     for r in rows:
         rid = r.get("id") or r.get("skillTypeId") or r.get("researchTypeId")
         name = (r.get("name") or r.get("displayName") or "").strip()
-        cat = (r.get("category") or r.get("group") or r.get("tree") or "").strip()
         lvl = int(r.get("currentLevel") or r.get("level") or 0)
-        maxl= int(r.get("maxLevel") or r.get("maximumLevel") or 0)
         gold= int(r.get("goldCost") or r.get("gold") or 0)
         gems= int(r.get("gemCost") or r.get("gems") or 0)
         time= (r.get("timeNext") or r.get("researchNextLevel") or r.get("duration") or "").strip()
-        can = bool(r.get("canTrain", True))
-        preq= r.get("prerequisites") or r.get("prereqText") or ""
-        if isinstance(preq,list): preq=", ".join(str(x.get("name") if isinstance(x,dict) else x) for x in preq)
-        out.append({"id":str(rid) if rid is not None else "","name":name,"category":cat,"currentLevel":lvl,"maxLevel":maxl,
-                    "goldCost":gold,"gemCost":gems,"timeText":time,"canTrain":can,"prereqText":str(preq)})
+        out.append({"id":str(rid) if rid is not None else "","name":name,"currentLevel":lvl,"goldCost":gold,"gemCost":gems,"timeText":time})
     return out
 
 def normalize_training_skills(ts_json: dict) -> List[dict]:
@@ -519,7 +508,22 @@ def normalize_training_skills(ts_json: dict) -> List[dict]:
         out.append({"id":str(rid) if rid is not None else "","name":name,"eta":remaining,"targetLevel":level_to})
     return out
 
-# ---------------- Bot ----------------
+# ---------------- bot core ----------------
+
+@dataclass
+class KingdomState:
+    id: int = 0
+    name: str = ""
+    tax_rate: int = 24
+    land: int = 0
+    resources: Dict[str, int] = field(default_factory=dict)
+    storage: Dict[str, int] = field(default_factory=dict)
+    prod_per_hour: Dict[str, int] = field(default_factory=dict)
+    units: Dict[str, int] = field(default_factory=dict)
+    buildings: Dict[str, int] = field(default_factory=dict)
+    research: Dict[str, Any] = field(default_factory=dict)
+    queues: Dict[str, Any] = field(default_factory=dict)
+    season: str = ""
 
 class Bot:
     def __init__(self, cfg: Config):
@@ -550,7 +554,8 @@ class Bot:
 
         return KingdomState(
             id=int(kd.get("id", 0)), name=kd.get("name",""),
-            tax_rate=int(kd.get("taxRate",24)), land=int(kd.get("land", resources.get("land",0))),
+            tax_rate=int(kd.get("taxRate",24)),
+            land=int(kd.get("land", resources.get("land",0))),
             resources={"food":resources["food"],"wood":resources["wood"],"stone":resources["stone"],"gold":resources["gold"]},
             storage={"food":storage["food"],"wood":storage["wood"],"stone":storage["stone"],"gold":storage["gold"]},
             prod_per_hour=prod, units=units, buildings=buildings,
@@ -577,28 +582,25 @@ class Bot:
                 "heavy_cav":u.get("heavy_cav",0),"knights":u.get("knights",0)}
 
     def _plan_explore_payload(self, st: KingdomState, danger: float) -> List[dict]:
-        keep = {"peasants": 30 if danger>=3 else 20, "footmen": max(10,int(5+danger*2)), "pikemen":10, "archers":10,
+        keep = {"peasants": 20 if danger<3 else 30, "footmen": max(8,int(4+danger*2)), "pikemen":10, "archers":10,
                 "light_cav": 0 if danger<5 else 5, "heavy_cav": 0 if danger<7 else 5, "knights": 0 if danger<8 else 2}
         idl = self.idle_units(st)
         pct = 0.85 if self.is_early_game(st) and danger < 3 else (0.4 if danger < 5 else 0.2)
-
         plan = {}
         for k in ("peasants","footmen","pikemen","archers","light_cav","heavy_cav","knights"):
             avail = max(0, idl.get(k,0) - keep.get(k,0))
             plan[k] = int(avail * pct)
-
         if sum(plan.values()) < 15 and idl.get("peasants",0) > keep["peasants"]:
             plan["peasants"] = max(plan["peasants"], min(40, idl["peasants"] - keep["peasants"]))
-
-        arr = []
+        arr=[]
         if self.cfg.allow_peasant_explore and plan.get("peasants",0) > 0:
             arr.append({"TroopTypeID": self.client.TROOP_ID["peasants"], "AmountToSend": int(plan["peasants"])})
         for k in ("footmen","pikemen","archers","light_cav","heavy_cav","knights"):
             n = int(plan.get(k,0))
-            if n <= 0: continue
-            if danger >= 5:
-                n = min(n, 3 if k in ("light_cav","heavy_cav","knights") else 5)
-            arr.append({"TroopTypeID": self.client.TROOP_ID[k], "AmountToSend": n})
+            if n>0:
+                if danger >= 5:
+                    n = min(n, 3 if k in ("light_cav","heavy_cav","knights") else 5)
+                arr.append({"TroopTypeID": self.client.TROOP_ID[k], "AmountToSend": n})
         return arr
 
     async def plan_exploration(self, st: KingdomState) -> str:
@@ -607,12 +609,15 @@ class Bot:
         payload = self._plan_explore_payload(st, danger)
         if not payload:
             return "Explore: no eligible units or danger too high"
+
         res = await self.client.explore(payload)
         if str(res.get("ReturnValue")) == "1":
             minutes = random.uniform(30, 45) if self.is_early_game(st) else random.uniform(60, 90)
             self._explore_back_at = local_now(self.cfg.tz_name) + timedelta(minutes=minutes)
             self.brain.log_explore(sent=payload, result="OK", land_before=st.land, land_after=None)
             return f"Explore sent (danger={danger:.1f}, ETA ~{minutes:.0f}m)"
+
+        # fallback: no peasants
         payload_no_peas = [t for t in payload if t.get("TroopTypeID") != self.client.TROOP_ID["peasants"]]
         if len(payload_no_peas) != len(payload) and payload_no_peas:
             res2 = await self.client.explore(payload_no_peas)
@@ -621,148 +626,47 @@ class Bot:
                 self._explore_back_at = local_now(self.cfg.tz_name) + timedelta(minutes=minutes)
                 self.brain.log_explore(sent=payload_no_peas, result="OK(fallback)", land_before=st.land, land_after=None)
                 return f"Explore sent (fallback no-peas, danger={danger:.1f}, ETA ~{minutes:.0f}m)"
-        self.brain.log_explore(sent=payload, result=res.get("ReturnString","fail"), land_before=st.land, land_after=None)
+
         return f"Explore failed: {res.get('ReturnString','unknown')}"
-
-    async def maybe_fix_storage(self, st: KingdomState) -> Optional[str]:
-        msgs=[]
-        if st.resources["wood"] >= st.storage["wood"]:
-            if st.queues["can_build"].get("lumber", True) and st.queues["building_inprog"].get("lumber",0)==0:
-                d = await self.client.build(buildingTypeId="9", quantity=1); msgs.append(f"Build Lumber Yard -> {d.get('ReturnString','OK')}")
-        if st.resources["stone"] >= st.storage["stone"]:
-            if st.queues["can_build"].get("quarries", True) and st.queues["building_inprog"].get("quarries",0)==0:
-                d = await self.client.build(buildingTypeId="6", quantity=1); msgs.append(f"Build Stone Quarry -> {d.get('ReturnString','OK')}")
-        return " | ".join(msgs) if msgs else None
-
-    def _find_skill_id(self, skills: List[dict], name_like: str) -> Optional[str]:
-        key = name_like.lower().replace(" ","")
-        for s in skills:
-            if s["name"].lower().replace(" ","")==key: return s["id"] or None
-        for s in skills:
-            if key in s["name"].lower().replace(" ",""): return s["id"] or None
-        return None
 
     async def maybe_research(self, st: KingdomState) -> str:
         if (st.research.get("in_progress") or []): return "Research in progress"
         skills = st.research.get("skills") or []
+        def find(name_like: str) -> Optional[str]:
+            k = name_like.lower().replace(" ","")
+            for s in skills:
+                if (s["name"] or "").lower().replace(" ","")==k: return s["id"] or None
+            for s in skills:
+                if k in (s["name"] or "").lower().replace(" ",""): return s["id"] or None
+            return None
         pick=None
-        if st.resources["food"] < max(10000, st.storage["food"]*0.25) or st.prod_per_hour.get("food",0) < 3000:
-            for n in ("Better Farming Methods","Irrigation","Mathematics"):
-                sid = self._find_skill_id(skills,n)
-                if sid: pick=(n,sid); break
-        if pick is None and st.resources["gold"] < max(10000, st.storage["gold"]*0.2):
-            for n in ("Mathematics","Accounting"):
-                sid = self._find_skill_id(skills,n)
-                if sid: pick=(n,sid); break
-        if pick is None:
-            for n in ("Engineering","Improved Tools","Better Construction Methods"):
-                sid = self._find_skill_id(skills,n)
-                if sid: pick=(n,sid); break
-        if pick is None: return "No suitable research"
+        if st.prod_per_hour.get("food",0) < 3000:    pick=("Better Farming Methods", find("Better Farming Methods"))
+        if not pick and st.prod_per_hour.get("gold",0) < 500: pick=("Mathematics", find("Mathematics"))
+        if not pick: pick=("Engineering", find("Engineering"))
+        if not pick or not pick[1]: return "No suitable research"
         name,sid = pick
-        row = next((s for s in skills if s.get("id")==sid), {})
-        gcost = int(row.get("goldCost") or 0)
-        if gcost and st.resources["gold"] < gcost:
-            return f"Research '{name}': need {gcost} gold"
         res = await self.client.train_skill(sid)
         return res.get("ReturnString", f"Research queued: {name}")
-
-    def _parse_message_actions(self, subject: str, body: str) -> List[Tuple[str, Any]]:
-        s = (subject or "").lower(); b = (body or "").lower()
-        actions: List[Tuple[str, Any]] = []
-
-        if "tutorial 1" in s and "explore" in (s+b): actions.append(("explore_hint", None))
-        if "tutorial 2" in s and "gems" in s: actions.append(("note", "tutorial_gems_info"))
-        if "completed quest" in s: actions.append(("note", "quest_completed"))
-        if "spy report" in s: actions.append(("note", "log_spy_report"))
-        if "attack report" in s: actions.append(("note", "log_attack_report"))
-
-        m = re.search(r"set\s+tax\s+to\s+(\d+)", b)
-        if m: actions.append(("set_tax", max(0, min(26, int(m.group(1))))))
-
-        if any(k in b for k in ("build farm","grain farm","more food","run out of food")):
-            actions.append(("build", {"typeId":"2","qty":1}))
-        if any(k in b for k in ("build barracks","train footmen")):
-            actions.append(("build", {"typeId":"16","qty":1}))
-        if any(k in b for k in ("build lumber","wood storage","wood cap")):
-            actions.append(("build", {"typeId":"9","qty":1}))
-        if any(k in b for k in ("build quarry","stone storage","stone cap")):
-            actions.append(("build", {"typeId":"6","qty":1}))
-        if "build barn" in b:
-            actions.append(("build", {"typeId":"22","qty":1}))
-
-        if "send explorers" in b or "explore for land" in b:
-            actions.append(("explore_hint", None))
-
-        if "research" in b:
-            if "farming" in b or "food" in b: actions.append(("research_hint","Better Farming Methods"))
-            elif "engineering" in b or "build faster" in b: actions.append(("research_hint","Engineering"))
-            elif "mathematics" in b or "tax" in b: actions.append(("research_hint","Mathematics"))
-
-        if "train footmen" in b: actions.append(("train_hint","footmen"))
-        if "train spies" in b or "build spies" in b: actions.append(("train_hint","spies"))
-        return actions
 
     async def process_messages(self, st: KingdomState):
         if not self.cfg.messages_enabled: return
         inbox = await self.client.get_messages_list()
         rows = inbox.get("messages") or inbox.get("items") or inbox.get("inbox") or []
-        msgs=[]
-        for r in rows:
+        # open a few most relevant
+        mids=[]
+        for r in rows[:6]:
             mid = r.get("id") or r.get("messageId") or r.get("Id")
-            if not mid: continue
-            subject = r.get("subject") or r.get("Subject") or ""
-            sender  = r.get("from") or r.get("sender") or r.get("From") or "System"
-            is_read = bool(r.get("isRead") or r.get("read") or r.get("IsRead") or False)
-            msgs.append((int(mid), subject, sender, is_read))
-        pri=[]
-        for mid, sub, snd, read in msgs:
-            score = (0 if not read else 10)
-            if (sub or "").lower().startswith(("tutorial","completed quest")): score -= 5
-            if (snd or "").lower()=="system": score -= 1
-            pri.append((score, mid, sub, snd, read))
-        pri.sort()
-        to_open = [(mid, sub, snd) for _, mid, sub, snd, _ in pri[:5]]
-
-        acted_any=False
-        for mid, sub, snd in to_open:
+            if mid: mids.append(int(mid))
+        for mid in mids:
             try:
-                m = await self.client.get_message(int(mid))
+                m = await self.client.get_message(mid)
             except Exception as e:
-                self.logger.warning("GetMessage failed for %s: %s", mid, e)
-                continue
-            body = m.get("body") or m.get("Body") or m.get("messageBody") or m.get("MessageBody") or ""
-            subject = m.get("subject") or m.get("Subject") or sub or ""
-            sender  = m.get("from") or m.get("sender") or m.get("From") or snd or ""
-            self.brain.log_message(message_id=int(mid), subject=subject, sender=sender, body=body)
+                self.logger.info("GetMessage %s failed: %s", mid, e); continue
+            subject = m.get("subject") or m.get("Subject") or ""
+            sender  = m.get("from") or m.get("From") or "System"
+            body    = m.get("body") or m.get("Body") or ""
             self.logger.info("MESSAGE [%s] %s | from=%s", mid, subject, sender)
-
-            for kind, payload in self._parse_message_actions(subject, body):
-                if kind == "set_tax":
-                    self.logger.info("MSG ACTION: would set tax to %s (endpoint TBD)", payload)
-                elif kind == "build":
-                    type_id = payload.get("typeId"); qty = int(payload.get("qty",1))
-                    try:
-                        res = await self.client.build(type_id, qty)
-                        self.logger.info("MSG ACTION: build %s x%s -> %s", type_id, qty, res.get("ReturnString","OK"))
-                        acted_any = True
-                    except Exception as e:
-                        self.logger.info("MSG ACTION: build %s failed: %s", type_id, e)
-                elif kind == "explore_hint":
-                    msg = await self.plan_exploration(st); self.logger.info("MSG ACTION: %s", msg); acted_any=True
-                elif kind == "research_hint":
-                    skills = st.research.get("skills") or []
-                    sid = self._find_skill_id(skills, payload)
-                    if sid:
-                        res = await self.client.train_skill(sid)
-                        self.logger.info("MSG ACTION: research %s -> %s", payload, res.get("ReturnString","OK"))
-                        acted_any = True
-                elif kind == "train_hint":
-                    self.logger.info("MSG ACTION: would train %s (endpoint TBD)", payload)
-        if acted_any:
-            self.logger.info("Finished processing messages with actions.")
-        elif to_open:
-            self.logger.info("Processed messages; no actionable tutorial keywords found.")
+            self.brain.log_message(mid, subject, sender, body)
 
     def compute_idle_wait_minutes(self, st: KingdomState) -> float:
         tz = self.cfg.tz_name
@@ -773,9 +677,6 @@ class Bot:
             base = random.uniform(3, 12)
             if in_human_sleep_window(tz): base = random.uniform(8, 18)
             return base
-        near_cap_wood  = st.storage["wood"]  > 0 and st.resources["wood"]  >= st.storage["wood"]  * 0.95
-        near_cap_stone = st.storage["stone"] > 0 and st.resources["stone"] >= st.storage["stone"] * 0.95
-        if near_cap_wood or near_cap_stone: return random.uniform(4, 8)
         gold_hr = max(0, st.prod_per_hour.get("gold",0))
         target_gold = max(6000, min(20000, st.resources["gold"]+8000))
         gold_deficit = max(0, target_gold - st.resources["gold"])
@@ -785,36 +686,39 @@ class Bot:
         else:
             return max(5.0,  min(20.0, wait_for_gold + random.uniform(-2,4)))
 
-    async def step(self) -> None:
-        st = await self.fetch_state()
-        self.logger.info("Strategy: economic + adaptive | land=%s", st.land)
-        if st.resources["wood"] >= st.storage["wood"]:
-            self.logger.warning("Wood over-capacity: %s/%s - need more lumber", st.resources["wood"], st.storage["wood"])
-        if st.resources["stone"] >= st.storage["stone"]:
-            self.logger.warning("Stone over-capacity: %s/%s - need more quarries", st.resources["stone"], st.storage["stone"])
-        self.brain.log_tick(self.cfg.tick_minute)
+    async def fetch_state_safe(self) -> KingdomState:
+        # separate wrapper to surface clearer auth errors
+        try:
+            return await self.fetch_state()
+        except RuntimeError as e:
+            if "AUTH_FAIL" in str(e):
+                raise
+            raise
 
+    async def step(self) -> None:
+        st = await self.fetch_state_safe()
+        self.logger.info("Strategy: economic+adaptive | land=%s", st.land)
+
+        # messages & tutorials
         try: await self.process_messages(st)
         except Exception as e: self.logger.warning("Message processing error: %s", e)
 
+        # early exploration
         if self.is_early_game(st):
-            idl = self.idle_units(st)
-            self.logger.info("EARLY EXPLORE | idle P/F/Pi/A=%s/%s/%s/%s | explore_busy=%s | allow_peas=%s",
-                             idl["peasants"], idl["footmen"], idl["pikemen"], idl["archers"],
-                             st.queues.get("explore_busy"), self.cfg.allow_peasant_explore)
-            msg = await self.plan_exploration(st)
-            self.logger.info(msg)
+            self.logger.info("EARLY EXPLORE | land=%s | idle peas=%s foot=%s pi=%s arch=%s | explore_busy=%s",
+                             st.land, st.units.get("peasants",0), st.units.get("footmen",0),
+                             st.units.get("pikemen",0), st.units.get("archers",0),
+                             st.queues.get("explore_busy"))
+            msg = await self.plan_exploration(st); self.logger.info(msg)
 
-        if not st.queues.get("building_busy"):
-            m = await self.maybe_fix_storage(st)
-            if m: self.logger.info(m)
-
+        # research
         rmsg = await self.maybe_research(st); self.logger.info(rmsg)
 
+        # wait human-ish
         wait_min = self.compute_idle_wait_minutes(st)
-        self.logger.info("Idle sleep for %.1f minutes (queues build=%s train=%s explore=%s, gold/hr=%s)",
+        self.logger.info("Idle sleep for %.1f minutes (buildBusy=%s trainBusy=%s exploreBusy=%s)",
                          wait_min, st.queues.get("building_busy"), st.queues.get("training_busy"),
-                         st.queues.get("explore_busy"), st.prod_per_hour.get("gold",0))
+                         st.queues.get("explore_busy"))
         await asyncio.sleep(wait_min * 60)
 
     async def run(self):
@@ -829,21 +733,26 @@ class Bot:
             while True:
                 try:
                     await self.step()
+                except RuntimeError as e:
+                    if "AUTH_FAIL" in str(e):
+                        self.logger.error("Auth error: %s", e)
+                        # small backoff; next loop will login again
+                        await asyncio.sleep(20)
+                    else:
+                        self.logger.error("Step error: %s", e); await asyncio.sleep(20)
                 except Exception as e:
-                    self.logger.error("Step error: %s", e)
-                    await asyncio.sleep(30)
+                    self.logger.error("Step error: %s", e); await asyncio.sleep(20)
         finally:
             await self.client.close()
 
-# --------------- Entrypoint ---------------
+# --------------- entry ---------------
 
 if __name__ == "__main__":
     cfg = Config()
     if not cfg.mock and (not cfg.account_id or not cfg.kingdom_id):
         logger.error("Missing KG2_ACCOUNT_ID / KG2_KINGDOM_ID. Set KG2_MOCK=true to run sim.")
         sys.exit(1)
-    # You can now leave KG2_TOKEN blank if KG2_USERNAME/PASSWORD are provided (auto refresh).
-    if not cfg.mock and not (cfg.token or (cfg.username and cfg.password)):
-        logger.error("Provide KG2_TOKEN or KG2_USERNAME/KG2_PASSWORD for auto-refresh.")
+    if not cfg.mock and not (cfg.username and cfg.password) and not cfg.bootstrap_cookie:
+        logger.error("Provide KG2_USERNAME/KG2_PASSWORD (preferred) or KG2_SESSION_COOKIE.")
         sys.exit(1)
     asyncio.run(Bot(cfg).run())
