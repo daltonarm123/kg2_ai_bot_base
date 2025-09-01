@@ -2,3 +2,4 @@ httpx[http2]
 pydantic
 tenacity
 python-dotenv
+playwright
