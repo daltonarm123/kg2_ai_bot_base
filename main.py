@@ -73,13 +73,6 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
     return val or ""
 
 # Use environment variables (required for production)
-# For production deployment, use environment variables:
-# BASE_URL   = "https://www.kingdomgame.net"
-# ACCOUNT_ID = "16881"
-# TOKEN      = "BDADE8B9-C70D-4337-A48F-5EDA0D39948D"
-# KINGDOM_ID = 6045
-
-# Use environment variables (required for production)
 BASE_URL   = env("BASE_URL", required=True).rstrip("/")
 ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
@@ -155,10 +148,43 @@ class AlreadyUsedError(ApiError):
 class ApiClient:
     client: httpx.AsyncClient
     _endpoint_cache: Dict[str, str] = None
+    _session_valid: bool = True
+    _last_successful_request: float = 0
 
     def __post_init__(self):
         if self._endpoint_cache is None:
             self._endpoint_cache = {}
+    
+    async def validate_session(self) -> bool:
+        """Check if the current session is still valid by making a simple request"""
+        try:
+            # Try a simple request to see if we get HTML (session expired) or JSON (session valid)
+            test_url = f"{BASE_URL}/api/TrainPopulation"
+            test_payload = {
+                "accountId": ACCOUNT_ID,
+                "token": TOKEN,
+                "kingdomId": KINGDOM_ID,
+                "popTypeId": 17,
+                "quantity": 0  # Try with 0 quantity to avoid actually training
+            }
+            
+            r = await self.client.get(test_url, params=test_payload, timeout=HTTP_TIMEOUT)
+            response_text = r.text
+            
+            if response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text:
+                log.warning("Session validation failed - received HTML response")
+                self._session_valid = False
+                return False
+            else:
+                log.debug("Session validation successful")
+                self._session_valid = True
+                self._last_successful_request = asyncio.get_event_loop().time()
+                return True
+                
+        except Exception as e:
+            log.warning(f"Session validation failed: {e}")
+            self._session_valid = False
+            return False
 
     @retry(
         stop=stop_after_attempt(RETRIES),
@@ -696,6 +722,8 @@ async def main_async() -> None:
 
         # Check if we should keep alive and loop
         keep_alive = os.getenv("KEEP_ALIVE", "0") == "1"
+        consecutive_failures = 0
+        max_consecutive_failures = 5
         
         while True:
             try:
@@ -737,17 +765,36 @@ async def main_async() -> None:
                 await asyncio.sleep(60)
                 
             except Exception as e:
-                if "session expired" in str(e).lower() or "loading" in str(e).lower():
+                consecutive_failures += 1
+                error_msg = str(e).lower()
+                
+                if "session expired" in error_msg or "loading" in error_msg or "invalid" in error_msg:
                     if keep_alive:
-                        log.warning("Session expired. Waiting 300 seconds (5 minutes) before retry...")
-                        await asyncio.sleep(300)  # Wait 5 minutes before retry
+                        if consecutive_failures >= max_consecutive_failures:
+                            log.error(f"Too many consecutive failures ({consecutive_failures}). Waiting 600 seconds (10 minutes) before retry...")
+                            await asyncio.sleep(600)  # Wait 10 minutes for persistent failures
+                            consecutive_failures = 0  # Reset counter after long wait
+                        else:
+                            log.warning(f"Session issue (failure #{consecutive_failures}). Waiting 300 seconds (5 minutes) before retry...")
+                            await asyncio.sleep(300)  # Wait 5 minutes for session issues
                         continue
                     else:
                         log.error("Session expired and KEEP_ALIVE=0. Exiting.")
                         break
                 else:
-                    # Re-raise other exceptions
-                    raise
+                    # For other errors, wait shorter time and retry
+                    if keep_alive:
+                        log.warning(f"Operation failed (failure #{consecutive_failures}): {e}")
+                        if consecutive_failures >= max_consecutive_failures:
+                            log.error(f"Too many consecutive failures ({consecutive_failures}). Waiting 600 seconds (10 minutes) before retry...")
+                            await asyncio.sleep(600)
+                            consecutive_failures = 0
+                        else:
+                            await asyncio.sleep(60)  # Wait 1 minute for other errors
+                        continue
+                    else:
+                        # Re-raise other exceptions if not keeping alive
+                        raise
 
 
 def main() -> None:
