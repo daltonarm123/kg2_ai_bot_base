@@ -5,8 +5,8 @@ KG2 AI Bot - resilient auth (anti-forgery discovery + cookie fallback) + ASMX cl
 - Falls back to antiforgery cookie (.AspNetCore.Antiforgery*) as RequestVerificationToken header
 - Tries multiple login endpoints + field-name shapes
 - Supports pasting session cookies via KG2_SESSION_COOKIE / KG2_SESSION_COOKIE_FILE
-- Injects Cookie header on ALL requests (plus httpx cookie jar) for stricter WAFs
 - Keeps gameplay logic: explore, research, messages, adaptive idle sleep, sqlite "brain"
+- NEW: simple builder + trainer heuristics for early game
 """
 import os, sys, re, json, asyncio, logging, random, sqlite3
 from dataclasses import dataclass, field
@@ -71,9 +71,11 @@ class Config:
     use_browser_headers: bool = env_bool("KG2_USE_BROWSER_HEADERS", True)
     mock: bool = env_bool("KG2_MOCK", False)
 
-    # Session cookie support
+    # Paste a whole cookie header or a semicolon-joined string of cookies
     bootstrap_cookie: str = os.getenv("KG2_SESSION_COOKIE", "")
+    # Or point to a file with the cookie header (one line)
     bootstrap_cookie_file: str = os.getenv("KG2_SESSION_COOKIE_FILE", "")
+
     timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
 
 # ---------------- logging ----------------
@@ -108,8 +110,7 @@ class Brain:
 
 # ---------------- HTTP client ----------------
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0 (Win64; x64)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -119,30 +120,8 @@ BROWSER_HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "X-Requested-With": "XMLHttpRequest",
 }
+
 HTML_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-
-def _load_cookie_header(cfg: Config) -> str:
-    # prefer env, else file
-    raw = (cfg.bootstrap_cookie or "").strip()
-    if not raw and cfg.bootstrap_cookie_file and os.path.exists(cfg.bootstrap_cookie_file):
-        try:
-            with open(cfg.bootstrap_cookie_file, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-        except Exception as e:
-            logger.warning("Could not read KG2_SESSION_COOKIE_FILE: %s", e)
-    return raw
-
-def _apply_cookie_jar_and_header(raw_cookie: str, base_url: str) -> Tuple[Cookies, str]:
-    cookies = Cookies()
-    header = ""
-    host = urlsplit(base_url).hostname
-    if raw_cookie:
-        parts = [p.strip() for p in raw_cookie.split(";") if p.strip() and "=" in p]
-        for part in parts:
-            k, v = part.split("=", 1)
-            cookies.set(k.strip(), v.strip(), domain=host)
-        header = "; ".join([p.strip() for p in raw_cookie.split(";") if "=" in p])
-    return cookies, header
 
 class KG2Client:
     TROOP_ID = {
@@ -151,12 +130,26 @@ class KG2Client:
     }
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        # Load cookie header (env or file), also fill cookie jar
-        self._cookie_header_str = _load_cookie_header(cfg)
-        cookies, header = _apply_cookie_jar_and_header(self._cookie_header_str, cfg.base_url)
-        self._cookie_header_str = header or self._cookie_header_str  # normalize spacing/order
-        if self._cookie_header_str:
-            logger.info("Loaded session cookies (%d pairs).", self._cookie_header_str.count("="))
+        # Allow cookie header from file
+        cookie_blob = cfg.bootstrap_cookie.strip()
+        if (not cookie_blob) and cfg.bootstrap_cookie_file and os.path.exists(cfg.bootstrap_cookie_file):
+            try:
+                with open(cfg.bootstrap_cookie_file, "r", encoding="utf-8") as fh:
+                    cookie_blob = fh.read().strip()
+            except Exception:
+                cookie_blob = ""
+
+        cookies = Cookies()
+        if cookie_blob:
+            # Accept either "key=value; key=value" or a full "Cookie: ..." header; we normalize.
+            header = cookie_blob
+            if header.lower().startswith("cookie:"):
+                header = header.split(":",1)[1].strip()
+            for part in header.split(";"):
+                part = part.strip()
+                if not part or "=" not in part: continue
+                k, v = part.split("=", 1)
+                cookies.set(k.strip(), v.strip(), domain=urlsplit(cfg.base_url).hostname)
 
         self._client = httpx.AsyncClient(
             base_url=self.cfg.base_url,
@@ -171,15 +164,12 @@ class KG2Client:
     async def _warmup_for(self, referer_url: str):
         try:
             path = urlsplit(referer_url).path or "/"
-            hdrs = {
+            r = await self._client.get(path, headers={
                 "Accept": HTML_ACCEPT,
                 "Referer": self.cfg.origin_url + "/",
                 "Origin": self.cfg.origin_url,
-                "World-Id": str(self.cfg.world_id),
-            }
-            if self._cookie_header_str:
-                hdrs["Cookie"] = self._cookie_header_str
-            r = await self._client.get(path, headers=hdrs)
+                "world-id": str(self.cfg.world_id),
+            })
             logging.info("Warmup GET %s -> %s", path, r.status_code)
         except Exception as e:
             logging.warning("Warmup failed for %s: %s", referer_url, e)
@@ -207,9 +197,8 @@ class KG2Client:
         if not (self.cfg.username and self.cfg.password):
             return False
         lg_get = await self._client.get("/Account/Login", headers={
-            "Accept": HTML_ACCEPT, "World-Id": str(self.cfg.world_id),
+            "Accept": HTML_ACCEPT, "world-id": str(self.cfg.world_id),
             "Referer": self.cfg.origin_url + "/", "Origin": self.cfg.origin_url,
-            **({"Cookie": self._cookie_header_str} if self._cookie_header_str else {})
         })
         if lg_get.status_code != 200:
             logging.info("Login GET unexpected: %s", lg_get.status_code); return False
@@ -226,12 +215,10 @@ class KG2Client:
             "Content-Type":"application/x-www-form-urlencoded",
             "Origin": self.cfg.origin_url,
             "Referer": self.cfg.origin_url + "/Account/Login",
-            "World-Id": str(self.cfg.world_id),
+            "world-id": str(self.cfg.world_id),
         }
         if anti:
             headers_base["RequestVerificationToken"] = anti
-        if self._cookie_header_str:
-            headers_base["Cookie"] = self._cookie_header_str
 
         for ep in endpoints:
             for form in forms:
@@ -275,13 +262,11 @@ class KG2Client:
         h = {
             "Content-Type":"application/json",
             "Accept":"application/json, text/plain, */*",
-            "World-Id": str(self.cfg.world_id),
+            "world-id": str(self.cfg.world_id),
             "Origin": self.cfg.origin_url,
             "Referer": referer,
             "X-Requested-With": "XMLHttpRequest",
         }
-        if self._cookie_header_str:
-            h["Cookie"] = self._cookie_header_str
         return h
 
     async def _post_raw(self, path: str, body: dict, referer: str) -> httpx.Response:
@@ -334,6 +319,7 @@ class KG2Client:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
              "buildingTypeId": str(buildingTypeId), "quantity": int(quantity)}
         return await self.post_asmx("/WebService/Buildings.asmx/BuildBuilding", b, self.cfg.referer_buildings)
+
     async def get_skills(self) -> dict:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
         return await self.post_asmx("/WebService/Research.asmx/GetSkills", b, self.cfg.referer_research)
@@ -357,10 +343,13 @@ class KG2Client:
             except Exception:
                 continue
         return {"ReturnValue":0,"ReturnString":"No research endpoint accepted the request"}
+
     async def explore(self, troops_array: List[dict]) -> dict:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
              "troops": json.dumps(troops_array)}
         return await self.post_asmx("/WebService/Kingdoms.asmx/Explore", b, self.cfg.referer_war)
+
+    # --- Messages ---
     async def get_messages_list(self) -> dict:
         b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
         return await self.post_asmx("/WebService/Messages.asmx/GetMessages", b, self.cfg.referer_messages)
@@ -369,6 +358,30 @@ class KG2Client:
              "messageId": int(message_id)}
         per_msg_referer = f"https://www.kingdomgame.net/messages/message/{int(message_id)}"
         return await self.post_asmx("/WebService/Messages.asmx/GetMessage", b, per_msg_referer)
+
+    # --- Population / Training (best-effort endpoints) ---
+    async def get_population_types(self) -> dict:
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Population.asmx/GetPopulationTypeList", b, self.cfg.referer_war)
+
+    async def train_population(self, populationTypeId: int, quantity: int) -> dict:
+        base = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        referer = self.cfg.referer_war
+        attempts = [
+            ("/WebService/Population.asmx/TrainPopulation", base | {"populationTypeId": int(populationTypeId), "quantity": int(quantity)}),
+            ("/WebService/Population.asmx/TrainTroops",    base | {"populationTypeId": int(populationTypeId), "quantity": int(quantity)}),
+            ("/WebService/Population.asmx/Train",          base | {"populationTypeId": int(populationTypeId), "quantity": int(quantity)}),
+        ]
+        last = {"ReturnValue":0,"ReturnString":"No training endpoint accepted the request"}
+        for path, body in attempts:
+            try:
+                d = await self.post_asmx(path, body, referer)
+                last = d
+                if d.get("ReturnValue") == 1 or d.get("success"):
+                    return d
+            except Exception as e:
+                last = {"ReturnValue":0,"ReturnString":str(e)}
+        return last
 
 # ---------------- state normalization ----------------
 @dataclass
@@ -391,8 +404,8 @@ def _normalize_resources(rjs: dict):
     resources, storage, prod, flags = {}, {}, {}, {"maintenance_issue_wood": False, "maintenance_issue_stone": False}
     for r in (rjs or {}).get("resources", []):
         n = (r.get("name") or "").lower().strip()
-        key = name_map.get(n)
-        if not key: continue
+        key = name_map.get(n); ifkey = key is not None
+        if not ifkey: continue
         resources[key] = int(r.get("amount", 0))
         storage[key]   = int(r.get("capacity", 0))
         prod[key]      = int(r.get("productionPerHour", 0))
@@ -497,6 +510,109 @@ class Bot:
     def is_early_game(self, st: "KingdomState") -> bool:
         return st.land < 5000 or sum(st.buildings.values()) < 200
 
+    # -------- BUILDING LOGIC --------
+    async def build_if_needed(self, st: "KingdomState") -> str:
+        if st.queues.get("building_busy"):
+            return "Build: queue busy"
+
+        canb = st.queues.get("can_build", {}) or {}
+        b = st.buildings
+        res, cap = st.resources, st.storage
+        msgs = []
+
+        # 1) Relieve caps first (food/wood/stone)
+        def want_more(cap_key, amt_key, target_ratio=0.92):  # near cap
+            if cap.get(cap_key,0) <= 0: return False
+            return cap.get(cap_key,0) > 0 and (res.get(amt_key,0) / max(1,cap.get(cap_key,0))) >= target_ratio
+
+        # barns if food near cap
+        if want_more("food","food") and canb.get("barns", False):
+            msgs.append(await self._queue_build("Barns", 22, qty=1))  # id 22 from your dump
+        # lumber yards if wood near cap
+        if want_more("wood","wood") and canb.get("lumber", False):
+            msgs.append(await self._queue_build("Lumber Yards", 9, qty=1))
+        # quarries if stone near cap
+        if want_more("stone","stone") and canb.get("quarries", False):
+            msgs.append(await self._queue_build("Stone Quarries", 6, qty=1))
+
+        # 2) Early eco push: farms until ~6k/hr
+        if st.prod_per_hour.get("food",0) < 6000 and canb.get("farms", True):
+            msgs.append(await self._queue_build("Grain Farms", 2, qty=2))
+
+        # 3) Ensure troop buildings exist if we plan training soon
+        if b.get("archery",0) < 1 and canb.get("archery", True):
+            msgs.append(await self._queue_build("Archery Ranges", 17, qty=1))
+        if b.get("stables",0) < 1 and canb.get("stables", True):
+            msgs.append(await self._queue_build("Stables", 18, qty=1))
+
+        return " | ".join([m for m in msgs if m]) or "Build: no action"
+
+    async def _queue_build(self, name: str, type_id: int, qty: int = 1) -> str:
+        try:
+            d = await self.client.build(str(type_id), qty)
+            if str(d.get("ReturnValue")) == "1":
+                return f"Build queued: {name} x{qty}"
+            return f"Build {name} failed: {d.get('ReturnString','unknown')}"
+        except Exception as e:
+            return f"Build {name} error: {e}"
+
+    # -------- TRAINING LOGIC --------
+    def _housing_caps(self, st: "KingdomState") -> Dict[str,int]:
+        # Barracks: 50 infantry (Footmen + Pikemen [+ Elites]) each
+        # Archery Ranges: 20 archers each
+        # Stables: 10 cavalry (LC/HC/Knights) each
+        barracks_cap = st.buildings.get("barracks",0) * 50
+        archery_cap  = st.buildings.get("archery",0)  * 20
+        stables_cap  = st.buildings.get("stables",0)  * 10
+        return {"inf": barracks_cap, "arch": archery_cap, "cav": stables_cap}
+
+    def _current_by_class(self, st: "KingdomState") -> Dict[str,int]:
+        u = st.units
+        inf = u.get("footmen",0) + u.get("pikemen",0) + u.get("elites",0)
+        arch = u.get("archers",0) + u.get("crossbow",0)
+        cav = u.get("light_cav",0) + u.get("heavy_cav",0) + u.get("knights",0)
+        return {"inf":inf, "arch":arch, "cav":cav}
+
+    async def train_if_possible(self, st: "KingdomState") -> str:
+        if st.queues.get("training_busy"):
+            return "Train: queue busy"
+
+        caps = self._housing_caps(st)
+        cur  = self._current_by_class(st)
+
+        msgs = []
+        # INF priority early (cheap bodies), then ARCH, then CAV
+        def room(cls): return max(0, caps.get(cls,0) - cur.get(cls,0))
+
+        # Train Footmen first for cheap backbone
+        if room("inf") > 0:
+            amount = min(room("inf"), 10)  # small batches
+            msgs.append(await self._train("footmen", 17, amount))
+
+        # Train Archers if space
+        if room("arch") > 0:
+            amount = min(room("arch"), 10)
+            msgs.append(await self._train("archers", 20, amount))
+
+        # Train Light Cavalry if space (cheap cav)
+        if room("cav") > 0:
+            amount = min(room("cav"), 5)
+            msgs.append(await self._train("light_cav", 23, amount))
+
+        out = " | ".join([m for m in msgs if m])
+        return out or "Train: no action"
+
+    async def _train(self, label: str, pop_type_id: int, qty: int) -> str:
+        if qty <= 0: return ""
+        try:
+            d = await self.client.train_population(pop_type_id, qty)
+            if str(d.get("ReturnValue")) == "1":
+                return f"Train queued: {label} x{qty}"
+            return f"Train {label} failed: {d.get('ReturnString','unknown')}"
+        except Exception as e:
+            return f"Train {label} error: {e}"
+
+    # -------- EXPLORE / RESEARCH (existing) --------
     def idle_units(self, st: "KingdomState") -> Dict[str,int]:
         u = st.units or {}
         return {"peasants":u.get("peasants",0),"footmen":u.get("footmen",0),"pikemen":u.get("pikemen",0),
@@ -531,7 +647,6 @@ class Bot:
             self._explore_back_at = local_now(self.cfg.tz_name) + timedelta(minutes=minutes)
             self.brain.log_explore(sent=payload, result="OK", land_before=st.land, land_after=None)
             return f"Explore sent, ETA ~{minutes:.0f}m"
-        # retry without peasants if rejected
         payload2 = [t for t in payload if t["TroopTypeID"] != self.client.TROOP_ID["peasants"]]
         if payload2:
             res2 = await self.client.explore(payload2)
@@ -561,6 +676,7 @@ class Bot:
         res = await self.client.train_skill(sid)
         return res.get("ReturnString", f"Research queued: {name}")
 
+    # -------- Messages --------
     async def process_messages(self, st: "KingdomState"):
         if not self.cfg.messages_enabled: return
         inbox = await self.client.get_messages_list()
@@ -580,6 +696,7 @@ class Bot:
             self.logger.info("MESSAGE [%s] %s | from=%s", mid, subject, sender)
             self.brain.log_message(mid, subject, sender, body)
 
+    # -------- Idle timing --------
     def compute_idle_wait_minutes(self, st: "KingdomState") -> float:
         tz = self.cfg.tz_name
         mins_to_tick = minutes_until(self.cfg.tick_minute, tz)
@@ -604,15 +721,39 @@ class Bot:
     async def step(self) -> None:
         st = await self.fetch_state_safe()
         self.logger.info("Strategy: economic+adaptive | land=%s", st.land)
+
+        # Messages
         try: await self.process_messages(st)
         except Exception as e: self.logger.warning("Message processing error: %s", e)
+
+        # BUILD (before training so housing exists)
+        try:
+            bmsg = await self.build_if_needed(st)
+            self.logger.info(bmsg)
+        except Exception as e:
+            self.logger.warning("Build decision error: %s", e)
+
+        # TRAIN
+        try:
+            tmsg = await self.train_if_possible(st)
+            self.logger.info(tmsg)
+        except Exception as e:
+            self.logger.warning("Train decision error: %s", e)
+
+        # EXPLORE (early game focus)
         if self.is_early_game(st):
-            self.logger.info("EARLY EXPLORE | land=%s | idle P/F/Pi/A=%s/%s/%s/%s | explore_busy=%s",
-                             st.land, st.units.get("peasants",0), st.units.get("footmen",0),
-                             st.units.get("pikemen",0), st.units.get("archers",0),
-                             st.queues.get("explore_busy"))
+            self.logger.info(
+                "EARLY EXPLORE | land=%s | idle P/F/Pi/A=%s/%s/%s/%s | explore_busy=%s",
+                st.land, st.units.get("peasants",0), st.units.get("footmen",0),
+                st.units.get("pikemen",0), st.units.get("archers",0),
+                st.queues.get("explore_busy")
+            )
             msg = await self.plan_exploration(st); self.logger.info(msg)
+
+        # RESEARCH
         rmsg = await self.maybe_research(st); self.logger.info(rmsg)
+
+        # Idle like a human
         wait_min = self.compute_idle_wait_minutes(st)
         self.logger.info("Idle sleep for %.1f minutes (buildBusy=%s trainBusy=%s exploreBusy=%s)",
                          wait_min, st.queues.get("building_busy"), st.queues.get("training_busy"),
@@ -648,8 +789,9 @@ if __name__ == "__main__":
     if not cfg.mock and (not cfg.account_id or not cfg.kingdom_id):
         logger.error("Missing KG2_ACCOUNT_ID / KG2_KINGDOM_ID. Set KG2_MOCK=true to run sim.")
         sys.exit(1)
-    # Either user/pass or pasted session cookie
-    if not cfg.mock and not (cfg.username and cfg.password) and not (cfg.bootstrap_cookie or cfg.bootstrap_cookie_file):
+    # Either user/pass or a pasted session cookie (string or file)
+    have_cookie = bool(cfg.bootstrap_cookie.strip()) or (cfg.bootstrap_cookie_file and os.path.exists(cfg.bootstrap_cookie_file))
+    if not cfg.mock and not (cfg.username and cfg.password) and not have_cookie:
         logger.error("Provide KG2_USERNAME/KG2_PASSWORD (preferred) or KG2_SESSION_COOKIE / KG2_SESSION_COOKIE_FILE.")
         sys.exit(1)
     asyncio.run(Bot(cfg).run())
