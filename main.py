@@ -37,6 +37,13 @@ from typing import Any, Dict, Optional, List, Callable, Tuple
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
+
+# Try to import playwright for browser automation
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -249,8 +256,13 @@ class ApiClient:
                     log.debug(f"Login attempt failed for {attempt['url']}: {e}")
                     continue
             
-            # If all login attempts fail, try a different approach - maybe the credentials work directly
-            log.info("Standard login failed, trying direct API access...")
+            # If all login attempts fail, try browser-based login
+            log.info("Standard login failed, trying browser-based login...")
+            if await self.browser_login():
+                return True
+            
+            # If browser login fails, try direct API access
+            log.info("Browser login failed, trying direct API access...")
             return await self.try_direct_api_access()
             
         except Exception as e:
@@ -366,6 +378,78 @@ class ApiClient:
                 
         except Exception as e:
             log.warning(f"API exploration failed: {e}")
+
+    async def browser_login(self) -> bool:
+        """Use browser automation to log in and extract session cookies"""
+        if not PLAYWRIGHT_AVAILABLE:
+            log.warning("Playwright not available - cannot use browser login")
+            return False
+            
+        try:
+            log.info("Starting browser-based login...")
+            
+            async with async_playwright() as p:
+                # Launch browser in headless mode
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context()
+                page = await context.new_page()
+                
+                # Navigate to login page
+                await page.goto(f"{BASE_URL}/login")
+                await page.wait_for_load_state('networkidle')
+                
+                # Fill in login form
+                await page.fill('input[type="email"], input[name="email"], input[name="username"]', USERNAME)
+                await page.fill('input[type="password"], input[name="password"]', PASSWORD)
+                
+                # Click login button
+                await page.click('button[type="submit"], input[type="submit"], button:has-text("Login")')
+                
+                # Wait for navigation or success
+                try:
+                    await page.wait_for_url(lambda url: 'login' not in url, timeout=10000)
+                    log.info("Login successful - redirected from login page")
+                except:
+                    # Check if we're still on login page (login failed)
+                    current_url = page.url
+                    if 'login' in current_url:
+                        log.warning("Login failed - still on login page")
+                        await browser.close()
+                        return False
+                
+                # Extract cookies and set them in our HTTP client
+                cookies = await context.cookies()
+                for cookie in cookies:
+                    self.client.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain'))
+                
+                log.info(f"Extracted {len(cookies)} cookies from browser session")
+                
+                # Test if the session works
+                test_url = f"{BASE_URL}/api/TrainPopulation"
+                test_data = {
+                    "accountId": ACCOUNT_ID,
+                    "token": TOKEN,
+                    "kingdomId": KINGDOM_ID,
+                    "popTypeId": 17,
+                    "quantity": 0
+                }
+                
+                r = await self.client.get(test_url, params=test_data, timeout=HTTP_TIMEOUT)
+                if r.status_code == 200:
+                    response_text = r.text
+                    if not (response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text):
+                        log.info("✅ Browser login successful - API now returns JSON!")
+                        await browser.close()
+                        return True
+                    else:
+                        log.warning("Browser login completed but API still returns HTML")
+                
+                await browser.close()
+                return False
+                
+        except Exception as e:
+            log.warning(f"Browser login failed: {e}")
+            return False
 
     async def validate_credentials(self) -> bool:
         """Validate that our credentials work by trying a simple API call"""
