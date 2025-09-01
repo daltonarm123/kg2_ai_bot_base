@@ -72,6 +72,7 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val or ""
 
+# Use environment variables (required for production)
 BASE_URL   = env("BASE_URL", required=True).rstrip("/")
 ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
@@ -89,9 +90,15 @@ REFERER_WAR       = env("REFERER_WAR",       f"{BASE_URL}/warroom")
 REFERER_RESEARCH  = env("REFERER_RESEARCH",  f"{BASE_URL}/research")
 
 # Endpoints (adjust if your API uses a sub-path)
-TRAIN_POPULATION_ENDPOINT = f"{BASE_URL}/TrainPopulation"
-BUILD_ENDPOINT            = f"{BASE_URL}/BuildBuilding"
-GENERIC_ACTION_ENDPOINT   = f"{BASE_URL}/Action"
+# Try different endpoint patterns - the API might use a different structure
+TRAIN_POPULATION_ENDPOINT = f"{BASE_URL}/api/TrainPopulation"  # Try /api/ prefix
+BUILD_ENDPOINT            = f"{BASE_URL}/api/BuildBuilding"     # Try /api/ prefix
+GENERIC_ACTION_ENDPOINT   = f"{BASE_URL}/api/Action"           # Try /api/ prefix
+
+# Fallback endpoints if the above don't work
+FALLBACK_TRAIN_ENDPOINT = f"{BASE_URL}/TrainPopulation"
+FALLBACK_BUILD_ENDPOINT = f"{BASE_URL}/BuildBuilding"
+FALLBACK_ACTION_ENDPOINT = f"{BASE_URL}/Action"
 
 HTTP_TIMEOUT = 20.0
 RETRIES = 4
@@ -142,6 +149,11 @@ class AlreadyUsedError(ApiError):
 @dataclass
 class ApiClient:
     client: httpx.AsyncClient
+    _endpoint_cache: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self._endpoint_cache is None:
+            self._endpoint_cache = {}
 
     @retry(
         stop=stop_after_attempt(RETRIES),
@@ -149,21 +161,68 @@ class ApiClient:
         retry=retry_if_exception_type((httpx.HTTPError, ApiError)),
         reraise=True,
     )
-    async def post_json(self, url: str, payload: Dict[str, Any], referer: Optional[str] = None) -> Dict[str, Any]:
+    async def post_json(self, url: str, payload: Dict[str, Any], referer: Optional[str] = None, 
+                       fallback_url: Optional[str] = None) -> Dict[str, Any]:
         headers = {"Referer": referer} if referer else None
-        r = await self.client.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        # Some endpoints return {"d":"{\"ReturnValue\":2,...}"} — unwrap if present
-        if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
-            try:
-                inner = json.loads(data["d"])
-                if isinstance(inner, dict) and "ReturnValue" in inner:
-                    return {"ReturnValue": inner.get("ReturnValue", -1), "ReturnString": inner.get("ReturnString", "")}
-                return inner
-            except json.JSONDecodeError:
+        
+        try:
+            # Try POST first
+            r = await self.client.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            # Some endpoints return {"d":"{\"ReturnValue\":2,...}"} — unwrap if present
+            if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
+                try:
+                    inner = json.loads(data["d"])
+                    if isinstance(inner, dict) and "ReturnValue" in inner:
+                        return {"ReturnValue": inner.get("ReturnValue", -1), "ReturnString": inner.get("ReturnString", "")}
+                    return inner
+                except json.JSONDecodeError:
+                    return data
+            return data
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 405:
+                # Try GET with query parameters as fallback
+                log.info(f"POST failed with 405, trying GET with query parameters: {url}")
+                params = {k: str(v) for k, v in payload.items()}
+                r = await self.client.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+                
+                # Try to parse as JSON first
+                try:
+                    data = r.json()
+                    if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
+                        try:
+                            inner = json.loads(data["d"])
+                            if isinstance(inner, dict) and "ReturnValue" in inner:
+                                return {"ReturnValue": inner.get("ReturnValue", -1), "ReturnString": inner.get("ReturnString", "")}
+                            return inner
+                        except json.JSONDecodeError:
+                            return data
+                    return data
+                except:
+                    # If not JSON, return the text response
+                    return {"ReturnValue": 0, "ReturnString": r.text}
+            elif fallback_url and fallback_url != url:
+                log.info(f"Endpoint {url} failed, trying fallback: {fallback_url}")
+                # Try the fallback URL
+                r = await self.client.post(fallback_url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+                data = r.json()
+                # Cache the working endpoint
+                self._endpoint_cache[url] = fallback_url
+                # Unwrap if needed
+                if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
+                    try:
+                        inner = json.loads(data["d"])
+                        if isinstance(inner, dict) and "ReturnValue" in inner:
+                            return {"ReturnValue": inner.get("ReturnValue", -1), "ReturnString": inner.get("ReturnString", "")}
+                        return inner
+                    except json.JSONDecodeError:
+                        return data
                 return data
-        return data
+            else:
+                raise
 
     # ---- Domain helpers ----
     async def train_population(self, pop_type_id: int, qty: int) -> InnerReturn:
@@ -174,7 +233,8 @@ class ApiClient:
             popTypeId=pop_type_id,
             quantity=qty,
         ).model_dump()
-        resp = await self.post_json(TRAIN_POPULATION_ENDPOINT, req, referer=REFERER_WAR)
+        resp = await self.post_json(TRAIN_POPULATION_ENDPOINT, req, referer=REFERER_WAR, 
+                                  fallback_url=FALLBACK_TRAIN_ENDPOINT)
         ir = self._normalize(resp)
         self._raise_if_error(ir)
         return ir
@@ -187,7 +247,8 @@ class ApiClient:
             buildingTypeId=building_type_id,
             quantity=qty,
         ).model_dump()
-        resp = await self.post_json(BUILD_ENDPOINT, req, referer=REFERER_BUILDINGS)
+        resp = await self.post_json(BUILD_ENDPOINT, req, referer=REFERER_BUILDINGS,
+                                  fallback_url=FALLBACK_BUILD_ENDPOINT)
         ir = self._normalize(resp)
         self._raise_if_error(ir)
         return ir
@@ -201,7 +262,8 @@ class ApiClient:
             typeId=type_id,
             amount=amount,
         ).model_dump()
-        resp = await self.post_json(GENERIC_ACTION_ENDPOINT, req, referer=REFERER_RESEARCH)
+        resp = await self.post_json(GENERIC_ACTION_ENDPOINT, req, referer=REFERER_RESEARCH,
+                                  fallback_url=FALLBACK_ACTION_ENDPOINT)
         ir = self._normalize(resp)
         if "already used a speedup" in (ir.ReturnString or "").lower():
             raise AlreadyUsedError(ir.ReturnString)
@@ -223,6 +285,128 @@ class ApiClient:
     def _raise_if_error(ir: InnerReturn) -> None:
         if ir.ReturnValue >= 2:
             raise ApiError(f"Server error {ir.ReturnValue}: {ir.ReturnString or '<no message>'}")
+    
+    async def discover_endpoints(self) -> None:
+        """Test different endpoint patterns to find working ones"""
+        log.info("Discovering working API endpoints...")
+        
+        # Test patterns - try various common API endpoint structures
+        test_patterns = [
+            # Standard API patterns
+            f"{BASE_URL}/api/TrainPopulation",
+            f"{BASE_URL}/api/train",
+            f"{BASE_URL}/api/population/train",
+            
+            # Direct endpoints
+            f"{BASE_URL}/TrainPopulation", 
+            f"{BASE_URL}/train",
+            f"{BASE_URL}/population/train",
+            
+            # Game-specific patterns
+            f"{BASE_URL}/game/TrainPopulation",
+            f"{BASE_URL}/game/train",
+            f"{BASE_URL}/game/population/train",
+            f"{BASE_URL}/game/ajax/TrainPopulation",
+            
+            # AJAX patterns
+            f"{BASE_URL}/ajax/TrainPopulation",
+            f"{BASE_URL}/ajax/train",
+            
+            # Kingdom-specific patterns
+            f"{BASE_URL}/kingdom/TrainPopulation",
+            f"{BASE_URL}/kingdom/train",
+            
+            # Alternative patterns
+            f"{BASE_URL}/action/TrainPopulation",
+            f"{BASE_URL}/action/train",
+            f"{BASE_URL}/cmd/TrainPopulation",
+            f"{BASE_URL}/cmd/train",
+            
+            # Try with different HTTP methods
+            f"{BASE_URL}/TrainPopulation",
+            f"{BASE_URL}/train",
+            f"{BASE_URL}/population/train"
+        ]
+        
+        test_payload = {
+            "accountId": ACCOUNT_ID,
+            "token": TOKEN,
+            "kingdomId": KINGDOM_ID,
+            "popTypeId": 17,  # foot
+            "quantity": 1
+        }
+        
+        # Test both POST and GET methods
+        http_methods = ["POST", "GET"]
+        
+        for method in http_methods:
+            log.info(f"Testing {method} method...")
+            for pattern in test_patterns:
+                try:
+                    log.info(f"Testing {method} {pattern}")
+                    
+                    if method == "POST":
+                        r = await self.client.post(pattern, json=test_payload, timeout=5.0)
+                    else:  # GET
+                        # For GET, try with query parameters
+                        params = {k: str(v) for k, v in test_payload.items()}
+                        r = await self.client.get(pattern, params=params, timeout=5.0)
+                    
+                    if r.status_code not in [405, 404, 501, 500]:
+                        log.info(f"✅ Working endpoint found: {method} {pattern} (status: {r.status_code})")
+                        
+                        # Try to parse the response to see if it's valid
+                        try:
+                            data = r.json()
+                            log.info(f"Response data: {data}")
+                        except:
+                            log.info(f"Response text: {r.text[:200]}...")
+                        
+                        # Update the working endpoint
+                        if "TrainPopulation" in pattern or "train" in pattern.lower():
+                            global TRAIN_POPULATION_ENDPOINT
+                            TRAIN_POPULATION_ENDPOINT = pattern
+                            log.info(f"Updated TRAIN_POPULATION_ENDPOINT to: {pattern}")
+                        
+                        return  # Found a working endpoint
+                    else:
+                        log.info(f"❌ {method} {pattern} returned {r.status_code}")
+                        
+                except Exception as e:
+                    log.info(f"❌ {method} {pattern} failed: {type(e).__name__}")
+                    continue
+        
+        log.warning("No working endpoints found. You may need to manually discover the correct API structure.")
+        log.info("Try visiting the game website and inspecting network requests to find the correct endpoints.")
+        
+        # Try to examine the website structure
+        try:
+            log.info("Attempting to examine website structure...")
+            r = await self.client.get(f"{BASE_URL}/", timeout=10.0)
+            if r.status_code == 200:
+                html = r.text
+                log.info(f"Website loaded successfully. Looking for API endpoints...")
+                
+                # Look for common patterns in the HTML
+                import re
+                
+                # Look for AJAX endpoints
+                ajax_patterns = re.findall(r'["\']([^"\']*ajax[^"\']*)["\']', html, re.IGNORECASE)
+                if ajax_patterns:
+                    log.info(f"Found potential AJAX endpoints in HTML: {ajax_patterns[:5]}")
+                
+                # Look for form actions
+                form_patterns = re.findall(r'action=["\']([^"\']*)["\']', html, re.IGNORECASE)
+                if form_patterns:
+                    log.info(f"Found form actions: {form_patterns[:5]}")
+                
+                # Look for JavaScript API calls
+                js_patterns = re.findall(r'["\']([^"\']*api[^"\']*)["\']', html, re.IGNORECASE)
+                if js_patterns:
+                    log.info(f"Found potential API endpoints in JavaScript: {js_patterns[:5]}")
+                    
+        except Exception as e:
+            log.info(f"Could not examine website structure: {e}")
 
 # ---------- ID Maps ----------
 # Troops confirmed so far (add more as you confirm):
@@ -353,6 +537,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_raw.add_argument("--url", required=True)
     p_raw.add_argument("--json", required=True, help="JSON string payload (single quotes OK)")
 
+    # test endpoints
+    p_test = sub.add_parser("test-endpoints", help="Test different API endpoint patterns")
+
     return p
 
 def print_examples() -> None:
@@ -362,6 +549,7 @@ def print_examples() -> None:
         "  python main.py train --troop archer --qty 25 --per 1 --concurrent 5\n"
         "  python main.py build --building barracks --count 3 --concurrent 3\n"
         "  python main.py speedup --type-id 134207 --amount 50\n"
+        "  python main.py test-endpoints\n"
         "  python main.py raw --url https://example/TrainPopulation "
         "--json '{\"accountId\":\"32\",\"token\":\"...\",\"kingdomId\":41,\"popTypeId\":20,\"quantity\":1}'\n"
     )
@@ -431,6 +619,10 @@ async def run_raw(api: ApiClient, url: str, payload_str: str) -> None:
     data = await api.post_json(url, payload)
     print(json.dumps(data, indent=2))
 
+async def run_test_endpoints(api: ApiClient) -> None:
+    """Test different endpoint patterns to find working ones"""
+    await api.discover_endpoints()
+
 # ---------- Entry ----------
 async def main_async() -> None:
     parser = build_parser()
@@ -471,6 +663,14 @@ async def main_async() -> None:
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         api = ApiClient(client=client)
+        
+        # Auto-discover working endpoints if this is the first run
+        if not hasattr(api, '_endpoints_discovered'):
+            try:
+                await api.discover_endpoints()
+                api._endpoints_discovered = True
+            except Exception as e:
+                log.warning(f"Endpoint discovery failed: {e}")
 
         if args.cmd == "train":
             await run_train(
@@ -494,6 +694,8 @@ async def main_async() -> None:
             await run_speedup(api, type_id=args.type_id, amount=args.amount)
         elif args.cmd == "raw":
             await run_raw(api, url=args.url, payload_str=args.json)
+        elif args.cmd == "test-endpoints":
+            await run_test_endpoints(api)
         else:
             parser.print_help()
             print_examples()
