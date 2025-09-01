@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-KG2 AI Bot - main.py
-Auth-hardening version:
-- Warmup GET for each ASMX call with the exact Referer page
-- Adds X-Requested-With and browser-like headers
-- Logs richer diagnostics on 403/500
-Other features:
-- SQLite "brain" (events + learning)
-- Adaptive exploration with early-game peasants (toggle)
-- Tick-aware sleep + human-like windowing
-- Research + storage fixes
-- Messages inbox handling (tutorial/system)
+KG2 AI Bot - main.py (auto token refresh)
+- Detects auth failures and refreshes token automatically.
+- Refresh order:
+  (1) Form login via /Account/Login using KG2_USERNAME/KG2_PASSWORD
+  (2) Probe likely token endpoints and parse token
+  (3) Optional custom KG2_TOKEN_PROVIDER (returns {"token":"..."})
+- Retries the failed ASMX call once after refresh.
+- Retains: messages ("Pigeons"), early-game explore, research, capacity fixes,
+  tick-aware idle sleeps, SQLite "brain", warmups per referer.
 """
 
 import os, sys, json, asyncio, logging, random, sqlite3, re
@@ -24,9 +22,7 @@ except Exception:
 import httpx
 from urllib.parse import urlsplit
 
-# -----------------------
-# Time helpers
-# -----------------------
+# ----------------------- Time helpers -----------------------
 
 def local_now(tz_name: str = None) -> datetime:
     tz = None
@@ -48,9 +44,7 @@ def minutes_until(minute_past_hour: int, tz_name: str) -> float:
         target = target + timedelta(hours=1)
     return (target - now).total_seconds() / 60.0
 
-# -----------------------
-# Config / Environment
-# -----------------------
+# ----------------------- Config -----------------------
 
 def env_bool(key: str, default: bool=False) -> bool:
     v = os.getenv(key)
@@ -71,8 +65,11 @@ class Config:
     referer_research: str = os.getenv("KG2_REFERER_RESEARCH", "https://www.kingdomgame.net/research")
     referer_messages: str = os.getenv("KG2_REFERER_MESSAGES", "https://www.kingdomgame.net/messages")
 
+    username: str = os.getenv("KG2_USERNAME", "")
+    password: str = os.getenv("KG2_PASSWORD", "")
+    token_provider: str = os.getenv("KG2_TOKEN_PROVIDER", "")  # optional webhook that returns {"token": "..."}
+
     mock: bool = env_bool("KG2_MOCK", False)
-    max_rps: float = float(os.getenv("KG2_MAX_RPS", "0.4"))
     timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
     origin_url: str = "https://www.kingdomgame.net"
     tz_name: str = os.getenv("KG2_TZ", "America/Chicago")
@@ -80,19 +77,15 @@ class Config:
     allow_peasant_explore: bool = env_bool("KG2_ALLOW_PEASANT_EXPLORE", False)
     tick_minute: int = int(os.getenv("KG2_TICK_MINUTE", "2"))
     threat_window_hrs: int = int(os.getenv("KG2_THREAT_WINDOW_HRS", "48"))
-
     messages_enabled: bool = env_bool("KG2_MESSAGES_ENABLED", True)
+    auto_token: bool = env_bool("KG2_AUTO_TOKEN", True)
 
-# -----------------------
-# Logging
-# -----------------------
+# ----------------------- Logging -----------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("kg2bot")
 
-# -----------------------
-# SQLite Memory ("brain")
-# -----------------------
+# ----------------------- SQLite Brain -----------------------
 
 class Brain:
     def __init__(self, path="bot_memory.sqlite", tz="America/Chicago"):
@@ -169,15 +162,12 @@ class Brain:
                     (f'-{int(hours)} hours',))
         return [row[0] for row in cur.fetchall()]
 
-# -----------------------
-# HTTP Client
-# -----------------------
+# ----------------------- HTTP Client with Auto Token -----------------------
 
 class KG2Client:
     TROOP_ID = {
         "footmen":   17, "pikemen": 18, "archers": 20, "crossbow": 22,
-        "light_cav": 23, "heavy_cav": 24, "knights": 25,
-        "peasants": 1,
+        "light_cav": 23, "heavy_cav": 24, "knights": 25, "peasants": 1,
     }
 
     def __init__(self, cfg: Config):
@@ -187,7 +177,6 @@ class KG2Client:
             follow_redirects=True,
             timeout=self.cfg.timeout_s,
             headers={
-                # Browser-ish defaults
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -199,12 +188,11 @@ class KG2Client:
     async def close(self): await self._client.aclose()
 
     async def _warmup_for(self, referer_url: str):
-        """GET the referer page before we POST to its ASMX. Sends world-id header too."""
         try:
             path = urlsplit(referer_url).path or "/"
             headers = {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": self.cfg.origin_url + "/",  # site root
+                "Referer": self.cfg.origin_url + "/",
                 "Origin": self.cfg.origin_url,
                 "world-id": str(self.cfg.world_id),
             }
@@ -213,10 +201,105 @@ class KG2Client:
         except Exception as e:
             logging.warning("Warmup failed for %s: %s", referer_url, e)
 
-    async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
-        # Always warmup with the exact referer page first
-        await self._warmup_for(referer)
+    async def _try_token_provider(self) -> Optional[str]:
+        url = self.cfg.token_provider.strip()
+        if not url: return None
+        try:
+            r = await self._client.get(url, timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                tok = j.get("token") or j.get("Token") or j.get("authToken")
+                if tok: return str(tok)
+        except Exception as e:
+            logging.info("Custom token provider failed: %s", e)
+        return None
 
+    async def _login_form(self) -> bool:
+        """Login via /Account/Login with antiforgery; returns True if cookies/session established."""
+        if not (self.cfg.username and self.cfg.password):
+            return False
+        try:
+            # GET login page for anti-forgery token
+            r = await self._client.get("/Account/Login", headers={"world-id": str(self.cfg.world_id)})
+            if r.status_code != 200:
+                logging.info("Login GET failed: %s", r.status_code)
+                return False
+            m = re.search(r'name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"', r.text, re.I)
+            token = m.group(1) if m else ""
+            form = {
+                "__RequestVerificationToken": token,
+                "Email": self.cfg.username,
+                "Password": self.cfg.password,
+                "RememberMe": "true",
+            }
+            hdrs = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.cfg.origin_url,
+                "Referer": self.cfg.origin_url + "/Account/Login",
+                "world-id": str(self.cfg.world_id),
+            }
+            r2 = await self._client.post("/Account/Login", data=form, headers=hdrs)
+            if r2.status_code not in (200, 302):
+                logging.info("Login POST failed: %s", r2.status_code)
+                return False
+            # Warmup overview to finalize session
+            await self._warmup_for(self.cfg.referer_overview)
+            logging.info("Form login established (cookies present).")
+            return True
+        except Exception as e:
+            logging.info("Form login error: %s", e)
+            return False
+
+    async def _probe_token_endpoints(self) -> Optional[str]:
+        """Try a list of likely endpoints to fetch a fresh token."""
+        candidates = [
+            ("/WebService/Accounts.asmx/GetAuthToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
+            ("/WebService/Accounts.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
+            ("/WebService/Accounts.asmx/GetLoginToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
+            ("/WebService/Account.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
+            ("/WebService/Users.asmx/GetToken", {"accountId": self.cfg.account_id, "kingdomId": self.cfg.kingdom_id}),
+        ]
+        for path, body in candidates:
+            try:
+                d = await self._post_raw(path, body, self.cfg.referer_overview)
+                # unwrap .d if needed
+                if isinstance(d, dict) and "d" in d:
+                    try: d = json.loads(d["d"])
+                    except Exception: d = d["d"]
+                if isinstance(d, dict):
+                    tok = d.get("token") or d.get("Token") or d.get("authToken")
+                    if tok: return str(tok)
+            except Exception:
+                continue
+        return None
+
+    async def refresh_token(self) -> bool:
+        """Main refresh flow; updates cfg.token if successful."""
+        if not self.cfg.auto_token:
+            return False
+
+        # 1) optional custom provider
+        tok = await self._try_token_provider()
+        if tok:
+            self.cfg.token = tok
+            logging.info("Token refreshed via custom provider.")
+            return True
+
+        # 2) Form login to establish cookies; may be required for token endpoints
+        await self._login_form()
+
+        # 3) Probe token endpoints
+        tok = await self._probe_token_endpoints()
+        if tok:
+            self.cfg.token = tok
+            logging.info("Token refreshed via token endpoint.")
+            return True
+
+        logging.warning("Auto token refresh failed (no token endpoint responded).")
+        return False
+
+    async def _post_raw(self, path: str, body: dict, referer: str) -> httpx.Response:
+        await self._warmup_for(referer)
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
@@ -226,7 +309,21 @@ class KG2Client:
             "X-Requested-With": "XMLHttpRequest",
             "User-Agent": self._client.headers.get("User-Agent"),
         }
-        resp = await self._client.post(path, json=body, headers=headers)
+        return await self._client.post(path, json=body, headers=headers)
+
+    async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
+        """POST once; on auth fail, attempt refresh+retry once."""
+        # First attempt
+        resp = await self._post_raw(path, body, referer)
+        if resp.status_code in (401,403) or (resp.status_code==500 and resp.headers.get("Content-Type","").startswith("text/html")):
+            logging.error("Auth-ish failure %s on %s; attempting refresh...", resp.status_code, path)
+            if await self.refresh_token():
+                # swap new token into body if expected
+                if "token" in body:
+                    body["token"] = self.cfg.token
+                # Retry once
+                resp = await self._post_raw(path, body, referer)
+        # Final handling
         if resp.status_code in (401,403):
             tok = str(self.cfg.token)
             tok_masked = tok[:6] + "..." + tok[-4:] if len(tok) > 10 else "***"
@@ -236,7 +333,7 @@ class KG2Client:
             )
         if resp.status_code == 500 and resp.headers.get("Content-Type","").startswith("text/html"):
             snippet = resp.text[:300].replace("\n"," ")
-            raise RuntimeError(f"AUTH_FAIL 500-HTML at {path}. Likely bad/expired token or IP blocked. Snip: {snippet}")
+            raise RuntimeError(f"AUTH_FAIL 500-HTML at {path}. Snip: {snippet}")
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
@@ -244,37 +341,35 @@ class KG2Client:
             except Exception: return data
         return data
 
-    # Kingdoms
+    # ---------- API wrappers ----------
     async def get_details(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomDetails", body, self.cfg.referer_overview)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomDetails", b, self.cfg.referer_overview)
 
     async def get_resources(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomResources", body, self.cfg.referer_overview)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomResources", b, self.cfg.referer_overview)
 
     async def get_population(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomPopulation", body, self.cfg.referer_war)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomPopulation", b, self.cfg.referer_war)
 
     async def get_buildings(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomBuildings", body, self.cfg.referer_buildings)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Kingdoms.asmx/GetKingdomBuildings", b, self.cfg.referer_buildings)
 
-    # Buildings
     async def build(self, buildingTypeId: str, quantity: int) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
-                "buildingTypeId": str(buildingTypeId), "quantity": int(quantity)}
-        return await self.post_asmx("/WebService/Buildings.asmx/BuildBuilding", body, self.cfg.referer_buildings)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
+             "buildingTypeId": str(buildingTypeId), "quantity": int(quantity)}
+        return await self.post_asmx("/WebService/Buildings.asmx/BuildBuilding", b, self.cfg.referer_buildings)
 
-    # Research
     async def get_skills(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Research.asmx/GetSkills", body, self.cfg.referer_research)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Research.asmx/GetSkills", b, self.cfg.referer_research)
 
     async def get_training_skills(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Research.asmx/GetTrainingSkills", body, self.cfg.referer_research)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Research.asmx/GetTrainingSkills", b, self.cfg.referer_research)
 
     async def train_skill(self, skillTypeId: str) -> dict:
         base = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
@@ -295,26 +390,22 @@ class KG2Client:
                 continue
         return {"ReturnValue":0,"ReturnString":"No research train endpoint accepted the request"}
 
-    # Explore
     async def explore(self, troops_array: List[dict]) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
-                "troops": json.dumps(troops_array)}
-        return await self.post_asmx("/WebService/Kingdoms.asmx/Explore", body, self.cfg.referer_war)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
+             "troops": json.dumps(troops_array)}
+        return await self.post_asmx("/WebService/Kingdoms.asmx/Explore", b, self.cfg.referer_war)
 
-    # Messages
     async def get_messages_list(self) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
-        return await self.post_asmx("/WebService/Messages.asmx/GetMessages", body, self.cfg.referer_messages)
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
+        return await self.post_asmx("/WebService/Messages.asmx/GetMessages", b, self.cfg.referer_messages)
 
     async def get_message(self, message_id: int) -> dict:
-        body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
-                "messageId": int(message_id)}
+        b = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
+             "messageId": int(message_id)}
         per_msg_referer = f"https://www.kingdomgame.net/messages/message/{int(message_id)}"
-        return await self.post_asmx("/WebService/Messages.asmx/GetMessage", body, per_msg_referer)
+        return await self.post_asmx("/WebService/Messages.asmx/GetMessage", b, per_msg_referer)
 
-# -----------------------
-# State & Normalizers
-# -----------------------
+# ----------------------- Normalizers -----------------------
 
 @dataclass
 class KingdomState:
@@ -335,7 +426,7 @@ def _normalize_resources(res_api: dict) -> Tuple[dict, dict, dict, dict]:
     name_map = {"food":"food","gold":"gold","wood":"wood","stone":"stone","mana":"mana","land":"land","blue gems":"blue_gems"}
     resources, storage, prod, flags = {}, {}, {}, {"maintenance_issue_wood": False, "maintenance_issue_stone": False}
     for r in (res_api or {}).get("resources", []):
-        n = (r.get("name") or "").lower().strip(); key = name_map.get(n); 
+        n = (r.get("name") or "").lower().strip(); key = name_map.get(n)
         if not key: continue
         resources[key] = int(r.get("amount", 0)); storage[key] = int(r.get("capacity", 0)); prod[key] = int(r.get("productionPerHour", 0))
         if n=="wood" and r.get("maintenanceIssue"): flags["maintenance_issue_wood"]=True
@@ -349,7 +440,7 @@ def _normalize_population(pop_api: dict) -> Tuple[dict, dict, dict]:
                "spies":"spies","priests":"priests","diplomats":"diplomats","market wagons":"wagons"}
     units, inprog, returning = {}, {}, {}
     for r in (pop_api or {}).get("population", []):
-        name = (r.get("name") or "").lower().strip(); key = key_map.get(name); 
+        name = (r.get("name") or "").lower().strip(); key = key_map.get(name)
         if not key: continue
         units[key] = int(r.get("amount", 0)); inprog[key]=int(r.get("amountInProgress",0)); returning[key]=int(r.get("amountReturning",0))
     for k in key_map.values(): units.setdefault(k,0); inprog.setdefault(k,0); returning.setdefault(k,0)
@@ -361,7 +452,7 @@ def _normalize_buildings(b_api: dict) -> Tuple[dict, dict, dict]:
                 "barns":"barns","castles":"castles","horse farms":"horse_farms"}
     buildings, inprog, canb = {}, {}, {}
     for r in (b_api or {}).get("buildings", []):
-        name = (r.get("name") or "").lower().strip(); key = map_name.get(name); 
+        name = (r.get("name") or "").lower().strip(); key = map_name.get(name)
         if not key: continue
         buildings[key]=int(r.get("amount",0)); inprog[key]=int(r.get("amountInProgress",0)); canb[key]=bool(r.get("canBuild",False))
     for k in ("houses","farms","lumber","quarries","barracks","stables","archery","barns","markets","temples","castles"):
@@ -398,24 +489,7 @@ def normalize_training_skills(ts_json: dict) -> List[dict]:
         out.append({"id":str(rid) if rid is not None else "","name":name,"eta":remaining,"targetLevel":level_to})
     return out
 
-# -----------------------
-# Bot
-# -----------------------
-
-@dataclass
-class KingdomState:
-    id: int = 0
-    name: str = ""
-    tax_rate: int = 24
-    land: int = 0
-    resources: Dict[str, int] = field(default_factory=dict)
-    storage: Dict[str, int] = field(default_factory=dict)
-    prod_per_hour: Dict[str, int] = field(default_factory=dict)
-    units: Dict[str, int] = field(default_factory=dict)
-    buildings: Dict[str, int] = field(default_factory=dict)
-    research: Dict[str, Any] = field(default_factory=dict)
-    queues: Dict[str, Any] = field(default_factory=dict)
-    season: str = ""
+# ----------------------- Bot -----------------------
 
 class Bot:
     def __init__(self, cfg: Config):
@@ -617,7 +691,6 @@ class Bot:
     async def process_messages(self, st: KingdomState):
         if not self.cfg.messages_enabled:
             return
-
         inbox = await self.client.get_messages_list()
         rows = inbox.get("messages") or inbox.get("items") or inbox.get("inbox") or []
         msgs = []
@@ -754,7 +827,6 @@ class Bot:
         self.logger.info("Mode: %s", "Mock" if self.cfg.mock else "Live")
         self.logger.info("Kingdom ID: %s", self.cfg.kingdom_id)
         if not self.cfg.mock:
-            # global warmup
             try:
                 await self.client._warmup_for(self.cfg.referer_overview)
             except Exception:
@@ -770,13 +842,15 @@ class Bot:
         finally:
             await self.client.close()
 
-# -----------------------
-# Entrypoint
-# -----------------------
+# ----------------------- Entrypoint -----------------------
 
 if __name__ == "__main__":
     cfg = Config()
-    if not cfg.mock and (not cfg.account_id or not cfg.token or not cfg.kingdom_id):
-        logger.error("Missing live auth env (KG2_ACCOUNT_ID / KG2_TOKEN / KG2_KINGDOM_ID). Set KG2_MOCK=true to run sim.")
+    if not cfg.mock and (not cfg.account_id or not cfg.kingdom_id):
+        logger.error("Missing KG2_ACCOUNT_ID / KG2_KINGDOM_ID. Set KG2_MOCK=true to run sim.")
+        sys.exit(1)
+    # Token can now be empty at startup if KG2_USERNAME/PASSWORD are set.
+    if not cfg.mock and not cfg.token and not (cfg.username and cfg.password):
+        logger.error("Provide KG2_TOKEN or KG2_USERNAME/KG2_PASSWORD for auto-refresh.")
         sys.exit(1)
     asyncio.run(Bot(cfg).run())
