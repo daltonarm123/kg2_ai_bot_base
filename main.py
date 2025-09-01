@@ -12,7 +12,7 @@ Features
 - Helpful CLI help & examples when no subcommand is provided
 
 Install:
-    pip install httpx pydantic tenacity python-dotenv
+    pip install "httpx[http2]" pydantic tenacity python-dotenv
 
 Examples:
     python main.py train --troop foot --qty 1
@@ -51,6 +51,16 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("kg2.ai")
+
+# Optional HTTP/2 support. If the h2 package isn't installed, fall back to HTTP/1.1.
+try:
+    import h2  # noqa: F401
+    HTTP2_ENABLED = True
+except ModuleNotFoundError:
+    HTTP2_ENABLED = False
+    log.warning(
+        "h2 package not installed; HTTP/2 disabled. Install httpx[http2] to enable."
+    )
 
 # ---------- Config ----------
 load_dotenv()
@@ -426,7 +436,9 @@ async def main_async() -> None:
                 log.info("No command provided. Exiting.")
                 return
 
-    async with httpx.AsyncClient(headers={"User-Agent": "kg2-ai/1.3"}, http2=True) as client:
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "kg2-ai/1.3"}, http2=HTTP2_ENABLED
+    ) as client:
         api = ApiClient(client=client)
 
         if args.cmd == "train":
