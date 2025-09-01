@@ -56,6 +56,7 @@ log = logging.getLogger("kg2.ai")
 try:
     import h2  # noqa: F401
     HTTP2_ENABLED = True
+    log.info("HTTP/2 support enabled")
 except ModuleNotFoundError:
     HTTP2_ENABLED = False
     log.warning(
@@ -74,7 +75,12 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
 BASE_URL   = env("BASE_URL", required=True).rstrip("/")
 ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
-KINGDOM_ID = env("KINGDOM_ID", required=True)
+
+# Validate KINGDOM_ID is an integer
+try:
+    KINGDOM_ID = int(env("KINGDOM_ID", required=True))
+except ValueError:
+    raise RuntimeError("KINGDOM_ID must be a valid integer")
 
 # Optional referer URLs for requests that require them
 REFERER_OVERVIEW  = env("REFERER_OVERVIEW",  f"{BASE_URL}/overview")
@@ -164,7 +170,7 @@ class ApiClient:
         req = TrainPopulationReq(
             accountId=ACCOUNT_ID,
             token=TOKEN,
-            kingdomId=int(KINGDOM_ID),
+            kingdomId=KINGDOM_ID,
             popTypeId=pop_type_id,
             quantity=qty,
         ).model_dump()
@@ -177,7 +183,7 @@ class ApiClient:
         req = BuildReq(
             accountId=ACCOUNT_ID,
             token=TOKEN,
-            kingdomId=int(KINGDOM_ID),
+            kingdomId=KINGDOM_ID,
             buildingTypeId=building_type_id,
             quantity=qty,
         ).model_dump()
@@ -190,7 +196,7 @@ class ApiClient:
         req = GenericActionReq(
             accountId=ACCOUNT_ID,
             token=TOKEN,
-            kingdomId=int(KINGDOM_ID),
+            kingdomId=KINGDOM_ID,
             type=type_code,
             typeId=type_id,
             amount=amount,
@@ -204,10 +210,14 @@ class ApiClient:
 
     @staticmethod
     def _normalize(resp: Dict[str, Any]) -> InnerReturn:
-        if "ReturnValue" in resp:
-            return InnerReturn(**resp)
-        msg = resp.get("message") or resp.get("error") or str(resp)
-        return InnerReturn(ReturnValue=0 if resp.get("ok") else 1, ReturnString=msg)
+        try:
+            if "ReturnValue" in resp:
+                return InnerReturn(**resp)
+            msg = resp.get("message") or resp.get("error") or str(resp)
+            return InnerReturn(ReturnValue=0 if resp.get("ok") else 1, ReturnString=msg)
+        except Exception as e:
+            # Fallback for malformed responses
+            return InnerReturn(ReturnValue=1, ReturnString=f"Failed to parse response: {e}")
 
     @staticmethod
     def _raise_if_error(ir: InnerReturn) -> None:
@@ -300,9 +310,12 @@ async def fan_out(
         _, stop_reason = await t
         if stop_reason == "rss-stop":
             log.warning("Stopping remainder due to repeated resource failures.")
+            # Cancel remaining tasks and wait for them to finish
             for other in running:
                 if not other.done():
                     other.cancel()
+            # Wait for all tasks to complete (including canceled ones)
+            await asyncio.gather(*running, return_exceptions=True)
             break
 
 # ---------- CLI ----------
@@ -443,9 +456,20 @@ async def main_async() -> None:
                 log.info("No command provided. Exiting.")
                 return
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "kg2-ai/1.3"}, http2=HTTP2_ENABLED
-    ) as client:
+    # Create HTTP client with proper HTTP/2 handling
+    client_kwargs = {
+        "headers": {"User-Agent": "kg2-ai/1.3"},
+        "timeout": HTTP_TIMEOUT,
+        "limits": httpx.Limits(max_connections=20, max_keepalive_connections=10)
+    }
+    
+    if HTTP2_ENABLED:
+        client_kwargs["http2"] = True
+        log.info("Creating HTTP/2 client")
+    else:
+        log.info("Creating HTTP/1.1 client")
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         api = ApiClient(client=client)
 
         if args.cmd == "train":
