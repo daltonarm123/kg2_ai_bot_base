@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 KG2 AI Bot - main.py
+Auth-hardening version:
+- Warmup GET for each ASMX call with the exact Referer page
+- Adds X-Requested-With and browser-like headers
+- Logs richer diagnostics on 403/500
+Other features:
 - SQLite "brain" (events + learning)
-- Adaptive exploration (peasants optional early, auto-dials down under threat)
-- Tick-aware waking + human-like sleep
-- Research + simple storage fixes
-- Messages inbox handling (tutorial/system): list, read, act on tasks
+- Adaptive exploration with early-game peasants (toggle)
+- Tick-aware sleep + human-like windowing
+- Research + storage fixes
+- Messages inbox handling (tutorial/system)
 """
 
 import os, sys, json, asyncio, logging, random, sqlite3, re
@@ -17,6 +22,7 @@ try:
 except Exception:
     zoneinfo = None
 import httpx
+from urllib.parse import urlsplit
 
 # -----------------------
 # Time helpers
@@ -67,7 +73,7 @@ class Config:
 
     mock: bool = env_bool("KG2_MOCK", False)
     max_rps: float = float(os.getenv("KG2_MAX_RPS", "0.4"))
-    timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "20"))
+    timeout_s: int = int(os.getenv("KG2_TIMEOUT_S", "25"))
     origin_url: str = "https://www.kingdomgame.net"
     tz_name: str = os.getenv("KG2_TZ", "America/Chicago")
 
@@ -123,7 +129,6 @@ class Brain:
     def _nowstr(self):
         return local_now(self.tz).isoformat(timespec="seconds")
 
-    # recorders
     def log_explore(self, sent, result, land_before=None, land_after=None):
         self.conn.execute(
             "INSERT INTO events_explore(ts,sent_json,result,land_before,land_after) VALUES(?,?,?,?,?)",
@@ -152,15 +157,12 @@ class Brain:
             (self._nowstr(), int(message_id), subject or "", sender or "", body or ""))
     def mark_message_acted(self, message_id: int):
         self.conn.execute("UPDATE messages SET acted=1 WHERE message_id=?", (int(message_id),))
-
-    # analytics
     def recent_threat_score(self, hours=48) -> float:
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM events_attack_in WHERE ts >= datetime('now', ?)",
                     (f'-{int(hours)} hours',))
         hits = cur.fetchone()[0] or 0
         return min(10.0, (hits / 24.0) * 10.0)
-
     def recent_spy_targets(self, hours=24) -> List[int]:
         cur = self.conn.cursor()
         cur.execute("SELECT DISTINCT target FROM spy_reports WHERE ts >= datetime('now', ?)",
@@ -175,7 +177,7 @@ class KG2Client:
     TROOP_ID = {
         "footmen":   17, "pikemen": 18, "archers": 20, "crossbow": 22,
         "light_cav": 23, "heavy_cav": 24, "knights": 25,
-        "peasants": 1,  # only if allowed & supported
+        "peasants": 1,
     }
 
     def __init__(self, cfg: Config):
@@ -184,30 +186,54 @@ class KG2Client:
             base_url=self.cfg.base_url,
             follow_redirects=True,
             timeout=self.cfg.timeout_s,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-                     "Accept": "application/json, text/plain, */*"}
+            headers={
+                # Browser-ish defaults
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
         )
 
     async def close(self): await self._client.aclose()
 
-    async def warmup(self):
-        r = await self._client.get("/overview", headers={
-            "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer":"https://www.kingdomgame.net/","Origin": self.cfg.origin_url})
-        logger.info("Warmup GET /overview -> %s", r.status_code)
+    async def _warmup_for(self, referer_url: str):
+        """GET the referer page before we POST to its ASMX. Sends world-id header too."""
+        try:
+            path = urlsplit(referer_url).path or "/"
+            headers = {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": self.cfg.origin_url + "/",  # site root
+                "Origin": self.cfg.origin_url,
+                "world-id": str(self.cfg.world_id),
+            }
+            r = await self._client.get(path, headers=headers)
+            logging.info("Warmup GET %s -> %s", path, r.status_code)
+        except Exception as e:
+            logging.warning("Warmup failed for %s: %s", referer_url, e)
 
     async def post_asmx(self, path: str, body: dict, referer: str) -> dict:
+        # Always warmup with the exact referer page first
+        await self._warmup_for(referer)
+
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "world-id": str(self.cfg.world_id),
             "Origin": self.cfg.origin_url,
             "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
             "User-Agent": self._client.headers.get("User-Agent"),
         }
         resp = await self._client.post(path, json=body, headers=headers)
         if resp.status_code in (401,403):
-            raise RuntimeError(f"AUTH_FAIL {resp.status_code} at {path}. Check token/ids/referer/world-id.")
+            tok = str(self.cfg.token)
+            tok_masked = tok[:6] + "..." + tok[-4:] if len(tok) > 10 else "***"
+            raise RuntimeError(
+                f"AUTH_FAIL {resp.status_code} at {path} | referer={referer} | world={self.cfg.world_id} "
+                f"| acct={self.cfg.account_id} | king={self.cfg.kingdom_id} | token={tok_masked}"
+            )
         if resp.status_code == 500 and resp.headers.get("Content-Type","").startswith("text/html"):
             snippet = resp.text[:300].replace("\n"," ")
             raise RuntimeError(f"AUTH_FAIL 500-HTML at {path}. Likely bad/expired token or IP blocked. Snip: {snippet}")
@@ -277,12 +303,10 @@ class KG2Client:
 
     # Messages
     async def get_messages_list(self) -> dict:
-        """Read inbox via the known endpoint."""
         body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id}
         return await self.post_asmx("/WebService/Messages.asmx/GetMessages", body, self.cfg.referer_messages)
 
     async def get_message(self, message_id: int) -> dict:
-        """Open a single message with per-message Referer."""
         body = {"accountId": self.cfg.account_id, "token": self.cfg.token, "kingdomId": self.cfg.kingdom_id,
                 "messageId": int(message_id)}
         per_msg_referer = f"https://www.kingdomgame.net/messages/message/{int(message_id)}"
@@ -378,6 +402,21 @@ def normalize_training_skills(ts_json: dict) -> List[dict]:
 # Bot
 # -----------------------
 
+@dataclass
+class KingdomState:
+    id: int = 0
+    name: str = ""
+    tax_rate: int = 24
+    land: int = 0
+    resources: Dict[str, int] = field(default_factory=dict)
+    storage: Dict[str, int] = field(default_factory=dict)
+    prod_per_hour: Dict[str, int] = field(default_factory=dict)
+    units: Dict[str, int] = field(default_factory=dict)
+    buildings: Dict[str, int] = field(default_factory=dict)
+    research: Dict[str, Any] = field(default_factory=dict)
+    queues: Dict[str, Any] = field(default_factory=dict)
+    season: str = ""
+
 class Bot:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -422,8 +461,6 @@ class Bot:
         )
         return st
 
-    # ------------ Strategy helpers ------------
-
     def is_early_game(self, st: KingdomState) -> bool:
         return st.land < 5000 or sum(st.buildings.values()) < 200
 
@@ -435,8 +472,6 @@ class Bot:
         return {"peasants":u.get("peasants",0),"footmen":u.get("footmen",0),"pikemen":u.get("pikemen",0),
                 "archers":u.get("archers",0),"light_cav":u.get("light_cav",0),
                 "heavy_cav":u.get("heavy_cav",0),"knights":u.get("knights",0)}
-
-    # ---------- Exploration ----------
 
     def _plan_explore_payload(self, st: KingdomState, danger: float) -> List[dict]:
         keep = {"peasants": 30 if danger>=3 else 20, "footmen": max(10,int(5+danger*2)), "pikemen":10, "archers":10,
@@ -475,7 +510,6 @@ class Bot:
             self._explore_back_at = local_now(self.cfg.tz_name) + timedelta(minutes=minutes)
             self.brain.log_explore(sent=payload, result="OK", land_before=st.land, land_after=None)
             return f"Explore sent (danger={danger:.1f}, ETA ~{minutes:.0f}m)"
-        # fallback without peasants if needed
         payload_no_peas = [t for t in payload if t.get("TroopTypeID") != self.client.TROOP_ID["peasants"]]
         if len(payload_no_peas) != len(payload) and payload_no_peas:
             res2 = await self.client.explore(payload_no_peas)
@@ -486,8 +520,6 @@ class Bot:
                 return f"Explore sent (fallback no-peas, danger={danger:.1f}, ETA ~{minutes:.0f}m)"
         self.brain.log_explore(sent=payload, result=res.get("ReturnString","fail"), land_before=st.land, land_after=None)
         return f"Explore failed: {res.get('ReturnString','unknown')}"
-
-    # ---------- Buildings / Research ----------
 
     async def maybe_fix_storage(self, st: KingdomState) -> Optional[str]:
         msgs=[]
@@ -532,45 +564,37 @@ class Bot:
         res = await self.client.train_skill(sid)
         return res.get("ReturnString", f"Research queued: {name}")
 
-    # ---------- Messages ----------
-
     def _parse_message_actions(self, subject: str, body: str) -> List[Tuple[str, Any]]:
         s = (subject or "").lower()
         b = (body or "").lower()
         actions: List[Tuple[str, Any]] = []
 
-        # Tutorial subjects
         if "tutorial 1" in s and "explore" in (s+b):
             actions.append(("explore_hint", None))
         if "tutorial 2" in s and "gems" in s:
             actions.append(("note", "tutorial_gems_info"))
-
-        # Completed quest
         if "completed quest" in s:
             actions.append(("note", "quest_completed"))
-
-        # Spy / Attack reports
         if "spy report" in s:
             actions.append(("note", "log_spy_report"))
         if "attack report" in s:
             actions.append(("note", "log_attack_report"))
 
-        # Body-driven hints
         m = re.search(r"set\s+tax\s+to\s+(\d+)", b)
         if m:
             rate = max(0, min(26, int(m.group(1))))
             actions.append(("set_tax", rate))
 
         if any(k in b for k in ("build farm", "grain farm", "more food", "run out of food")):
-            actions.append(("build", {"typeId":"2","qty":1}))   # Grain Farm
+            actions.append(("build", {"typeId":"2","qty":1}))
         if any(k in b for k in ("build barracks", "train footmen")):
-            actions.append(("build", {"typeId":"16","qty":1}))  # Barracks
+            actions.append(("build", {"typeId":"16","qty":1}))
         if any(k in b for k in ("build lumber", "wood storage", "wood cap")):
-            actions.append(("build", {"typeId":"9","qty":1}))   # Lumber
+            actions.append(("build", {"typeId":"9","qty":1}))
         if any(k in b for k in ("build quarry", "stone storage", "stone cap")):
-            actions.append(("build", {"typeId":"6","qty":1}))   # Quarry
+            actions.append(("build", {"typeId":"6","qty":1}))
         if "build barn" in b:
-            actions.append(("build", {"typeId":"22","qty":1}))  # Barn
+            actions.append(("build", {"typeId":"22","qty":1}))
 
         if "send explorers" in b or "explore for land" in b:
             actions.append(("explore_hint", None))
@@ -605,7 +629,6 @@ class Bot:
             is_read = bool(r.get("isRead") or r.get("read") or r.get("IsRead") or False)
             msgs.append((int(mid), subject, sender, is_read))
 
-        # prioritize unread + tutorial/system
         pri = []
         for mid, sub, snd, read in msgs:
             score = (0 if not read else 10)
@@ -665,8 +688,6 @@ class Bot:
         elif to_open:
             self.logger.info("Processed messages; no actionable tutorial keywords found.")
 
-    # ---------- Sleep / Idle ----------
-
     def compute_idle_wait_minutes(self, st: KingdomState) -> float:
         tz = self.cfg.tz_name
         mins_to_tick = minutes_until(self.cfg.tick_minute, tz)
@@ -692,12 +713,6 @@ class Bot:
         else:
             return max(5.0,  min(20.0, wait_for_gold + random.uniform(-2,4)))
 
-    async def maybe_speed_return_with_gems(self, context="post-attack"):
-        # Hook for return-speedup when endpoint known
-        return
-
-    # ---------- Main loop ----------
-
     async def step(self) -> None:
         st = await self.fetch_state()
         self.logger.info("Strategy: economic + adaptive | land=%s", st.land)
@@ -709,13 +724,11 @@ class Bot:
 
         self.brain.log_tick(self.cfg.tick_minute)
 
-        # Messages first (tutorial rewards often unlock/provide guidance)
         try:
             await self.process_messages(st)
         except Exception as e:
             self.logger.warning("Message processing error: %s", e)
 
-        # Early game exploration
         if self.is_early_game(st):
             idl = self.idle_units(st)
             self.logger.info("EARLY EXPLORE | idle P/F/Pi/A=%s/%s/%s/%s | explore_busy=%s | allow_peas=%s",
@@ -724,15 +737,12 @@ class Bot:
             msg = await self.plan_exploration(st)
             self.logger.info(msg)
 
-        # Storage fixes
         if not st.queues.get("building_busy"):
             m = await self.maybe_fix_storage(st)
             if m: self.logger.info(m)
 
-        # Research
         rmsg = await self.maybe_research(st); self.logger.info(rmsg)
 
-        # Idle / Sleep
         wait_min = self.compute_idle_wait_minutes(st)
         self.logger.info("Idle sleep for %.1f minutes (queues build=%s train=%s explore=%s, gold/hr=%s)",
                          wait_min, st.queues.get("building_busy"), st.queues.get("training_busy"),
@@ -743,7 +753,12 @@ class Bot:
         self.logger.info("KG2 AI Bot initializing...")
         self.logger.info("Mode: %s", "Mock" if self.cfg.mock else "Live")
         self.logger.info("Kingdom ID: %s", self.cfg.kingdom_id)
-        if not self.cfg.mock: await self.client.warmup()
+        if not self.cfg.mock:
+            # global warmup
+            try:
+                await self.client._warmup_for(self.cfg.referer_overview)
+            except Exception:
+                pass
         self.logger.info("Starting main bot loop...")
         try:
             while True:
