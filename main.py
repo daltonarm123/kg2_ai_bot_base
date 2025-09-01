@@ -73,11 +73,16 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
     return val or ""
 
 # Use environment variables (required for production)
+# For production deployment, use environment variables:
+# BASE_URL   = "https://www.kingdomgame.net"
+# ACCOUNT_ID = "16881"
+# TOKEN      = "BDADE8B9-C70D-4337-A48F-5EDA0D39948D"
+# KINGDOM_ID = 6045
+
+# Use environment variables (required for production)
 BASE_URL   = env("BASE_URL", required=True).rstrip("/")
 ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
-
-# Validate KINGDOM_ID is an integer
 try:
     KINGDOM_ID = int(env("KINGDOM_ID", required=True))
 except ValueError:
@@ -201,8 +206,13 @@ class ApiClient:
                             return data
                     return data
                 except:
-                    # If not JSON, return the text response
-                    return {"ReturnValue": 0, "ReturnString": r.text}
+                    # If not JSON, check if it's HTML (game loading page)
+                    response_text = r.text
+                    if response_text.strip().startswith('<!DOCTYPE html>') or '<html>' in response_text:
+                        log.warning("Received HTML response - game may be loading or session expired")
+                        return {"ReturnValue": 1, "ReturnString": "Game session expired or loading"}
+                    # Return the text response for other non-JSON responses
+                    return {"ReturnValue": 0, "ReturnString": response_text}
             elif fallback_url and fallback_url != url:
                 log.info(f"Endpoint {url} failed, trying fallback: {fallback_url}")
                 # Try the fallback URL
@@ -480,6 +490,9 @@ async def fan_out(
                     rss_fail_streak += 1
                     if rss_fail_streak >= MAX_RSS_FAIL_STREAK:
                         return (i, "rss-stop")
+                elif "session expired" in msg.lower() or "loading" in msg.lower():
+                    log.error("Game session expired or loading - stopping all operations")
+                    return (i, "session-stop")
                 return (i, None)
             except httpx.HTTPError as e:
                 log.warning("%s [%d/%d] network error → %s", label, i + 1, tasks_needed, e)
@@ -494,6 +507,15 @@ async def fan_out(
         _, stop_reason = await t
         if stop_reason == "rss-stop":
             log.warning("Stopping remainder due to repeated resource failures.")
+            # Cancel remaining tasks and wait for them to finish
+            for other in running:
+                if not other.done():
+                    other.cancel()
+            # Wait for all tasks to complete (including canceled ones)
+            await asyncio.gather(*running, return_exceptions=True)
+            break
+        elif stop_reason == "session-stop":
+            log.error("Stopping all operations due to session expiration.")
             # Cancel remaining tasks and wait for them to finish
             for other in running:
                 if not other.done():
