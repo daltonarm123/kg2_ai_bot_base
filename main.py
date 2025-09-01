@@ -1,19 +1,21 @@
 """
-main.py — KG2 AI Bot Base (async) — concurrency edition (with your building IDs)
+main.py — KG2 AI Bot Base (async, concurrent)
 
-What’s inside
-- .env config: BASE_URL, ACCOUNT_ID, TOKEN, KINGDOM_ID
-- Async HTTP (httpx) + retries (tenacity) + logging
-- Concurrent train/build (ignores “busy”, throttles instead)
-- Exact BuildBuilding payload (buildingTypeId + quantity)
-- Speedup/spend helper (generic action)
+Features
+- .env-driven config: BASE_URL, ACCOUNT_ID, TOKEN, KINGDOM_ID
+- Async HTTP via httpx + retries (tenacity) + structured logging
+- TrainPopulation & BuildBuilding helpers (quantity per call)
+- Concurrency fan-out with RSS-aware stop (stops after repeated "not enough resources")
+- Speedup/spend-style generic action
 - Raw POST escape hatch
-- Fill in any missing TROOP IDs as you confirm them
+- Pydantic v2-compatible validators
+- Helpful CLI help & examples when no subcommand is provided
 
-Install
+Install:
     pip install httpx pydantic tenacity python-dotenv
 
-Run examples
+Examples:
+    python main.py train --troop foot --qty 1
     python main.py train --troop archer --qty 25 --per 1 --concurrent 5
     python main.py build --building barracks --count 3 --concurrent 3
     python main.py speedup --type-id 134207 --amount 50
@@ -33,7 +35,7 @@ from typing import Any, Dict, Optional, List, Callable, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -63,15 +65,15 @@ ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
 KINGDOM_ID = env("KINGDOM_ID", required=True)
 
-# Endpoints (adjust if different in your environment)
+# Endpoints (adjust if your API uses a sub-path)
 TRAIN_POPULATION_ENDPOINT = f"{BASE_URL}/TrainPopulation"
-BUILD_ENDPOINT            = f"{BASE_URL}/BuildBuilding"   # <- per your payloads
+BUILD_ENDPOINT            = f"{BASE_URL}/BuildBuilding"
 GENERIC_ACTION_ENDPOINT   = f"{BASE_URL}/Action"
 
 HTTP_TIMEOUT = 20.0
 RETRIES = 4
 DEFAULT_CONCURRENCY = 5
-CALL_SPACING_SEC = 0.05   # small delay between task enqueues
+CALL_SPACING_SEC = 0.05   # small delay between enqueued tasks
 
 # ---------- Models ----------
 class TrainPopulationReq(BaseModel):
@@ -82,7 +84,6 @@ class TrainPopulationReq(BaseModel):
     quantity: int
 
 class BuildReq(BaseModel):
-    # matches your "BuildBuilding" payload shape
     accountId: str
     token: str
     kingdomId: int
@@ -90,7 +91,7 @@ class BuildReq(BaseModel):
     quantity: int = 1
 
 class InnerReturn(BaseModel):
-    ReturnValue: int = Field(..., description="Server-defined (0/1 ok, 2+ = error per your tests)")
+    ReturnValue: int = Field(..., description="Server-defined (0/1 ok, ≥2 error)")
     ReturnString: str = ""
 
 class GenericActionReq(BaseModel):
@@ -101,7 +102,8 @@ class GenericActionReq(BaseModel):
     typeId: int
     amount: int
 
-    @validator("amount")
+    @field_validator("amount")
+    @classmethod
     def nonzero(cls, v: int) -> int:
         if v == 0:
             raise ValueError("amount cannot be 0")
@@ -128,7 +130,7 @@ class ApiClient:
         r = await self.client.post(url, json=payload, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        # Some endpoints nest a JSON string in "d"
+        # Some endpoints return {"d":"{\"ReturnValue\":2,...}"} — unwrap if present
         if isinstance(data, dict) and "d" in data and isinstance(data["d"], str):
             try:
                 inner = json.loads(data["d"])
@@ -195,21 +197,16 @@ class ApiClient:
             raise ApiError(f"Server error {ir.ReturnValue}: {ir.ReturnString or '<no message>'}")
 
 # ---------- ID Maps ----------
-# Troops: fill in any missing once you confirm via your logs.
+# Troops confirmed so far (add more as you confirm):
 TROOP_TO_POPTYPE: Dict[str, int] = {
-    "archer": 20,
-    "pike": 21,
-    "lightcav": 22,   # “Light Cavalry”
-    "foot": 17,       # “Footmen”
-    "peasant": 24,    # “Peasants / workers”
-    # Confirm and add when ready:
-    # "crossbowman": ??,
-    # "elite": ??,
-    # "heavycav": ??,
-    # "knight": ??,
+    "foot": 17,        # Footmen
+    "archer": 20,      # Archers
+    "pike": 21,        # Pikemen
+    "lightcav": 22,    # Light Cavalry
+    "peasant": 24,     # Peasants / workers
 }
 
-# Buildings: from your BuildBuilding payloads
+# Buildings from your BuildBuilding payloads:
 BUILDING_TO_TYPEID: Dict[str, int] = {
     "house": 1,            # Houses
     "grainfarm": 2,        # Grain Farms
@@ -251,7 +248,7 @@ async def fan_out(
     if per_request <= 0:
         raise ValueError("--per must be >= 1")
     tasks_needed = (total + per_request - 1) // per_request
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(max(1, concurrency))
     rss_fail_streak = 0
     MAX_RSS_FAIL_STREAK = 3
 
@@ -282,7 +279,7 @@ async def fan_out(
         await asyncio.sleep(CALL_SPACING_SEC)
 
     for t in asyncio.as_completed(running):
-        idx, stop_reason = await t
+        _, stop_reason = await t
         if stop_reason == "rss-stop":
             log.warning("Stopping remainder due to repeated resource failures.")
             for other in running:
@@ -292,14 +289,18 @@ async def fan_out(
 
 # ---------- CLI ----------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="kg2-ai", description="KG2 AI Bot Base (concurrency)")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = argparse.ArgumentParser(
+        prog="kg2-ai",
+        description="KG2 AI Bot Base (concurrency)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     # train
     p_train = sub.add_parser("train", help="Train population units (concurrent)")
     p_train.add_argument("--troop", required=True, choices=sorted(set(list(TROOP_TO_POPTYPE.keys()) + ["custom"])))
     p_train.add_argument("--qty", type=int, default=1, help="Total units to train")
-    p_train.add_argument("--per", type=int, default=1, help="Units per request")
+    p_train.add_argument("--per", type=int, default=1, help="Units per request (payload 'quantity')")
     p_train.add_argument("--concurrent", type=int, default=DEFAULT_CONCURRENCY, help="Max concurrent requests")
     p_train.add_argument("--pop-type-id", type=int, help="Required if --troop custom")
 
@@ -307,11 +308,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_build = sub.add_parser("build", help="Construct buildings (concurrent)")
     p_build.add_argument("--building", required=True, choices=sorted(set(list(BUILDING_TO_TYPEID.keys()) + ["custom"])))
     p_build.add_argument("--count", type=int, default=1, help="Total buildings to place")
-    p_build.add_argument("--per", type=int, default=1, help="Buildings per request (quantity per call)")
+    p_build.add_argument("--per", type=int, default=1, help="Buildings per request (payload 'quantity')")
     p_build.add_argument("--concurrent", type=int, default=DEFAULT_CONCURRENCY, help="Max concurrent requests")
     p_build.add_argument("--building-type-id", type=int, help="Required if --building custom")
 
-    # speedup/spend-like action
+    # speedup / spend-like action
     p_sp = sub.add_parser("speedup", help="Attempt single speedup/spend-style action")
     p_sp.add_argument("--type-id", type=int, required=True)
     p_sp.add_argument("--amount", type=int, required=True)
@@ -322,6 +323,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_raw.add_argument("--json", required=True, help="JSON string payload (single quotes OK)")
 
     return p
+
+def print_examples() -> None:
+    print(
+        "\nExamples:\n"
+        "  python main.py train --troop foot --qty 1\n"
+        "  python main.py train --troop archer --qty 25 --per 1 --concurrent 5\n"
+        "  python main.py build --building barracks --count 3 --concurrent 3\n"
+        "  python main.py speedup --type-id 134207 --amount 50\n"
+        "  python main.py raw --url https://example/TrainPopulation "
+        "--json '{\"accountId\":\"32\",\"token\":\"...\",\"kingdomId\":41,\"popTypeId\":20,\"quantity\":1}'\n"
+    )
 
 # ---------- Runners ----------
 async def run_train(api: ApiClient, troop: str, qty: int, per: int, concurrent: int, pop_type_id: Optional[int]) -> None:
@@ -342,7 +354,7 @@ async def run_train(api: ApiClient, troop: str, qty: int, per: int, concurrent: 
     await fan_out(
         total=qty,
         per_request=per,
-        concurrency=max(1, concurrent),
+        concurrency=concurrent,
         worker=worker,
         label=f"train {troop_name}",
     )
@@ -360,13 +372,12 @@ async def run_build(api: ApiClient, building: str, count: int, per: int, concurr
         bname = building
 
     async def worker(chunk_count: int) -> InnerReturn:
-        # quantity == how many instances to queue in *this* call
         return await api.build_building(btid, chunk_count)
 
     await fan_out(
         total=count,
         per_request=per,
-        concurrency=max(1, concurrent),
+        concurrency=concurrent,
         worker=worker,
         label=f"build {bname}",
     )
@@ -394,7 +405,12 @@ async def main_async() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    async with httpx.AsyncClient(headers={"User-Agent": "kg2-ai/1.2"}, http2=True) as client:
+    if not args.cmd:
+        parser.print_help()
+        print_examples()
+        sys.exit(2)
+
+    async with httpx.AsyncClient(headers={"User-Agent": "kg2-ai/1.3"}, http2=True) as client:
         api = ApiClient(client=client)
 
         if args.cmd == "train":
@@ -421,6 +437,8 @@ async def main_async() -> None:
             await run_raw(api, url=args.url, payload_str=args.json)
         else:
             parser.print_help()
+            print_examples()
+            sys.exit(2)
 
 def main() -> None:
     try:
