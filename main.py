@@ -422,9 +422,8 @@ async def main_async() -> None:
                 await asyncio.Event().wait()
                 return
             else:
-                # Exit cleanly (code 0) so the platform doesn’t treat it as a crash.
-                parser.print_help()
-                print_examples()
+                # Quiet exit when no command is supplied to avoid repeated help spam.
+                log.info("No command provided. Exiting.")
                 return
 
     async with httpx.AsyncClient(headers={"User-Agent": "kg2-ai/1.3"}, http2=True) as client:
