@@ -1,6 +1,4 @@
-BASE_URL=https://www.kingdomgame.net
-ACCOUNT_ID=16881
-TOKEN=BDADE8B9-C70D-4337-A48F-5EDA0D39948D
-KINGDOM_ID=6045
-START_CMD=train --troop foot --qty 1 --per 1 --concurrent 3
-KEEP_ALIVE=1
+httpx[http2]
+pydantic
+tenacity
+python-dotenv
