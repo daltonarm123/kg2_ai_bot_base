@@ -76,6 +76,23 @@ ACCOUNT_ID = env("ACCOUNT_ID", required=True)
 TOKEN      = env("TOKEN", required=True)
 KINGDOM_ID = env("KINGDOM_ID", required=True)
 
+# Optional referer URLs for requests that require them
+REFERER_OVERVIEW  = env("REFERER_OVERVIEW",  f"{BASE_URL}/overview")
+REFERER_BUILDINGS = env("REFERER_BUILDINGS", f"{BASE_URL}/buildings")
+REFERER_WAR       = env("REFERER_WAR",       f"{BASE_URL}/warroom")
+REFERER_RESEARCH  = env("REFERER_RESEARCH",  f"{BASE_URL}/research")
+
+# Origin and user-agent headers (some endpoints reject missing or non-browser values)
+ORIGIN_URL = env("ORIGIN_URL", BASE_URL)
+USER_AGENT = env(
+    "USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+)
+
 # Endpoints (adjust if your API uses a sub-path)
 TRAIN_POPULATION_ENDPOINT = f"{BASE_URL}/TrainPopulation"
 BUILD_ENDPOINT            = f"{BASE_URL}/BuildBuilding"
@@ -137,8 +154,9 @@ class ApiClient:
         retry=retry_if_exception_type((httpx.HTTPError, ApiError)),
         reraise=True,
     )
-    async def post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        r = await self.client.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    async def post_json(self, url: str, payload: Dict[str, Any], referer: Optional[str] = None) -> Dict[str, Any]:
+        headers = {"Referer": referer} if referer else None
+        r = await self.client.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         # Some endpoints return {"d":"{\"ReturnValue\":2,...}"} — unwrap if present
@@ -160,8 +178,8 @@ class ApiClient:
             kingdomId=int(KINGDOM_ID),
             popTypeId=pop_type_id,
             quantity=qty,
-        ).dict()
-        resp = await self.post_json(TRAIN_POPULATION_ENDPOINT, req)
+        ).model_dump()
+        resp = await self.post_json(TRAIN_POPULATION_ENDPOINT, req, referer=REFERER_WAR)
         ir = self._normalize(resp)
         self._raise_if_error(ir)
         return ir
@@ -173,8 +191,8 @@ class ApiClient:
             kingdomId=int(KINGDOM_ID),
             buildingTypeId=building_type_id,
             quantity=qty,
-        ).dict()
-        resp = await self.post_json(BUILD_ENDPOINT, req)
+        ).model_dump()
+        resp = await self.post_json(BUILD_ENDPOINT, req, referer=REFERER_BUILDINGS)
         ir = self._normalize(resp)
         self._raise_if_error(ir)
         return ir
@@ -187,8 +205,8 @@ class ApiClient:
             type=type_code,
             typeId=type_id,
             amount=amount,
-        ).dict()
-        resp = await self.post_json(GENERIC_ACTION_ENDPOINT, req)
+        ).model_dump()
+        resp = await self.post_json(GENERIC_ACTION_ENDPOINT, req, referer=REFERER_RESEARCH)
         ir = self._normalize(resp)
         if "already used a speedup" in (ir.ReturnString or "").lower():
             raise AlreadyUsedError(ir.ReturnString)
@@ -370,7 +388,14 @@ async def run_train(api: ApiClient, troop: str, qty: int, per: int, concurrent: 
         label=f"train {troop_name}",
     )
 
-async def run_build(api: ApiClient, building: str, count: int, per: int, concurrent: int, building_type_id: Optional[int]) -> None:
+async def run_build(
+    api: ApiClient,
+    building: str,
+    count: int,
+    per: int,
+    concurrent: int,
+    building_type_id: Optional[int],
+) -> None:
     if building == "custom":
         if not building_type_id:
             raise SystemExit("--building-type-id is required when --building custom")
@@ -437,7 +462,13 @@ async def main_async() -> None:
                 return
 
     async with httpx.AsyncClient(
-        headers={"User-Agent": "kg2-ai/1.3"}, http2=HTTP2_ENABLED
+        headers={
+            "User-Agent": USER_AGENT,
+            "Origin": ORIGIN_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+        http2=HTTP2_ENABLED,
     ) as client:
         api = ApiClient(client=client)
 
