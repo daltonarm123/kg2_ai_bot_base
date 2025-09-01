@@ -24,6 +24,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import shlex
 import asyncio
 import json
 import logging
@@ -403,12 +404,28 @@ async def run_raw(api: ApiClient, url: str, payload_str: str) -> None:
 # ---------- Entry ----------
 async def main_async() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
 
+    # If no subcommand, try START_CMD from env; otherwise either idle or print help.
     if not args.cmd:
-        parser.print_help()
-        print_examples()
-        sys.exit(2)
+        start_cmd = os.getenv("START_CMD", "").strip()
+        if start_cmd:
+            log.info("No CLI args provided. Using START_CMD from .env: %s", start_cmd)
+            # Re-parse as if the user typed: python main.py <START_CMD>
+            args = parser.parse_args(shlex.split(start_cmd))
+        else:
+            if os.getenv("KEEP_ALIVE", "0") == "1":
+                parser.print_help()
+                print_examples()
+                log.info("KEEP_ALIVE=1 set. Idling because no command was provided…")
+                # Sleep forever without exiting so your host doesn't restart the process.
+                await asyncio.Event().wait()
+                return
+            else:
+                # Exit cleanly (code 0) so the platform doesn’t treat it as a crash.
+                parser.print_help()
+                print_examples()
+                return
 
     async with httpx.AsyncClient(headers={"User-Agent": "kg2-ai/1.3"}, http2=True) as client:
         api = ApiClient(client=client)
@@ -438,7 +455,8 @@ async def main_async() -> None:
         else:
             parser.print_help()
             print_examples()
-            sys.exit(2)
+            return
+
 
 def main() -> None:
     try:
