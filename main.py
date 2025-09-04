@@ -3189,8 +3189,8 @@ class AdvancedAI:
         """Smarter calculation for troop training quantity based on resources and game phase."""
         base_cost = {'foot': 50, 'archer': 75, 'cavalry': 150, 'siege': 300}
         unit_cost = base_cost.get(troop_type, 50)
-
         available_gold = self.state.estimated_resources.get('gold', 0)
+
 
         if 'train' in self.state.recent_failures:
             log.warning("🚨 Recent training failure. Training a minimal quantity.")
