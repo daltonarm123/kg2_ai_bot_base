@@ -517,20 +517,22 @@ class ApiClient:
                 
                 await page.wait_for_timeout(5000)  # Extra time for game to load
                 
+                # Dispatch to the correct browser helper method
+                success = False
                 if action_type == "train":
-                    return await self._browser_train_troops(page, params)
+                    success = await self._browser_train_troops(page, params)
                 elif action_type == "explore":
-                    return await self._browser_explore(page, params)
+                    success = await self._browser_explore(page, params)
                 elif action_type == "build":
-                    return await self._browser_build(page, params)
+                    success = await self._browser_build(page, params)
                 elif action_type == "spy":
-                    return await self._browser_spy(page, params)
+                    success = await self._browser_spy(page, params)
                 else:
-                    log.warning(f"Unknown browser action type: {action_type}")
-                    return False
-                    
+                    log.error(f"❌ Unknown browser action type: {action_type}")
+                    success = False
+
                 await browser.close()
-                return False
+                return success
                 
         except Exception as e:
             log.error(f"❌ Browser action {action_type} failed: {e}")
@@ -723,176 +725,74 @@ class ApiClient:
             return False
     
     async def _browser_explore(self, page, params):
-        """Explore using browser clicks"""
+        """Explore using browser clicks on warroom?action=explore page"""
         try:
-            # Look for explore section
+            log.info(f"🎮 Browser exploration started on explore page...")
+
+            # Look for exploration elements
             explore_selectors = [
-                'a[href*="explore"]',
                 'button:has-text("Explore")',
-                '.explore-tab',
-                '.explore-button'
+                'input[type="submit"][value*="Explore"]',
+                'button:has-text("Search")',
+                'button:has-text("Scout")',
+                'button[onclick*="explore"]',
+                '.explore-button',
+                'form[action*="explore"] button',
+                'form[action*="explore"] input[type="submit"]'
             ]
             
             for selector in explore_selectors:
                 try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
+                    element = await page.wait_for_selector(selector, timeout=3000)
                     if element:
                         await element.click()
-                        await page.wait_for_timeout(1000)
-                        log.info(f"✅ Clicked explore section: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Set direction and distance
-            direction = params.get('direction', 'north')
-            distance = params.get('distance', 10)
-            
-            # Select direction
-            direction_selectors = [
-                f'button:has-text("{direction.title()}")',
-                f'select option:has-text("{direction.title()}")',
-                f'.direction-{direction}',
-                f'input[value="{direction}"]'
-            ]
-            
-            for selector in direction_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        log.info(f"✅ Selected direction {direction}: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Enter distance/troops
-            distance_selectors = [
-                'input[type="number"]',
-                'input[name*="distance"]',
-                'input[name*="troops"]',
-                '.distance-input'
-            ]
-            
-            for selector in distance_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.fill(str(distance))
-                        log.info(f"✅ Set distance/troops {distance}: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Click explore button
-            submit_selectors = [
-                'button:has-text("Explore")',
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '.explore-submit'
-            ]
-            
-            for selector in submit_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
+                        log.info(f"✅ Clicked explore element: {selector}")
                         await page.wait_for_timeout(2000)
-                        log.info(f"✅ Clicked explore button: {selector}")
                         return True
                 except:
                     continue
                     
+            log.error("❌ Could not find exploration elements")
             return False
             
         except Exception as e:
-            log.error(f"❌ Browser explore failed: {e}")
+            log.error(f"❌ Browser exploration failed: {e}")
             return False
     
     async def _browser_build(self, page, params):
-        """Build using browser clicks"""
+        """Build using browser clicks on buildings page"""
         try:
-            # Look for build section
+            log.info(f"🎮 Browser building started on buildings page...")
+            
+            # Look for building elements
             build_selectors = [
-                'a[href*="build"]',
-                'button:has-text("Build")', 
-                'button:has-text("Construction")',
-                '.build-tab',
-                '.construction-tab'
+                'button:has-text("Build")',
+                'input[type="submit"][value*="Build"]',
+                'button:has-text("Houses")',
+                'button:has-text("Farms")',
+                'button:has-text("Markets")',
+                'button[onclick*="build"]',
+                '.build-button',
+                'form[action*="build"] button',
+                'form[action*="build"] input[type="submit"]'
             ]
             
             for selector in build_selectors:
                 try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
+                    element = await page.wait_for_selector(selector, timeout=3000)
                     if element:
                         await element.click()
-                        await page.wait_for_timeout(1000)
-                        log.info(f"✅ Clicked build section: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Select building type
-            building_type = params.get('building_type', 'Houses')
-            building_selectors = [
-                f'button:has-text("{building_type}")',
-                f'select option:has-text("{building_type}")',
-                f'.building-{building_type.lower().replace(" ", "-")}',
-                f'input[value="{building_type}"]'
-            ]
-            
-            for selector in building_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        log.info(f"✅ Selected building {building_type}: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Enter quantity
-            quantity = params.get('quantity', 1)
-            quantity_selectors = [
-                'input[type="number"]',
-                'input[name*="quantity"]',
-                'input[name*="amount"]',
-                '.quantity-input'
-            ]
-            
-            for selector in quantity_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.fill(str(quantity))
-                        log.info(f"✅ Set quantity {quantity}: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Click build button
-            submit_selectors = [
-                'button:has-text("Build")',
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '.build-submit'
-            ]
-            
-            for selector in submit_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
+                        log.info(f"✅ Clicked build element: {selector}")
                         await page.wait_for_timeout(2000)
-                        log.info(f"✅ Clicked build button: {selector}")
                         return True
                 except:
                     continue
                     
+            log.error("❌ Could not find building elements")
             return False
             
         except Exception as e:
-            log.error(f"❌ Browser build failed: {e}")
+            log.error(f"❌ Browser building failed: {e}")
             return False
     
     async def _browser_login_process(self, page):
@@ -1028,92 +928,7 @@ class ApiClient:
         except Exception as e:
             log.error(f"❌ Browser spying failed: {e}")
             return False
-
-    def parse_game_data(self, html_content: str) -> Dict[str, Any]:
-        """Extract REAL game data from HTML responses AND detect resource failures"""
-        game_data = {}
-
-        # CRITICAL: Check for red text / error messages indicating insufficient resources
-        red_text_patterns = [
-            r'<[^>]*style[^>]*color[^>]*red[^>]*>([^<]+)</[^>]*>',  # HTML red text
-            r'<[^>]*class[^>]*error[^>]*>([^<]+)</[^>]*>',          # Error class
-            r'insufficient|not enough|cannot afford|lack|need more|do not have',  # Text patterns
-            r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*)',               # "2,800 / 600" patterns
-        ]
-
-        has_resource_error = False
-        for pattern in red_text_patterns:
-            matches = re.findall(pattern, html_content, re.IGNORECASE)
-            if matches:
-                has_resource_error = True
-                log.warning(f"🚨 DETECTED RESOURCE ERROR: {matches}")
-                break
-
-        if has_resource_error:
-            game_data['resource_error'] = True
-            game_data['action_failed'] = True
-            
-        # Extract current resources from cost displays (like "2,800 / 600 gold")
-        resource_cost_patterns = [
-            (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?gold', 'gold'),
-            (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?wood', 'wood'),
-            (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?stone', 'stone'),
-            (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?food', 'food'),
-            (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?land', 'land'),
-        ]
-        
-        for pattern, resource_name in resource_cost_patterns:
-            matches = re.findall(pattern, html_content, re.IGNORECASE)
-            if matches:
-                for needed_str, available_str in matches:
-                    try:
-                        available = int(available_str.replace(',', ''))
-                        needed = int(needed_str.replace(',', ''))
-
-                        # Store both available and needed amounts
-                        game_data[f'{resource_name}_available'] = available
-                        game_data[f'{resource_name}_needed'] = needed
-
-                        # If needed > available, we have insufficient resources
-                        if needed > available:
-                            has_resource_error = True
-                            game_data['resource_error'] = True
-                            log.warning(f"🚨 INSUFFICIENT {resource_name.upper()}: need {needed}, have {available}")
-
-                        log.info(f"💰 EXTRACTED {resource_name}: have {available}, need {needed}")
-                        break
-                    except:
-                        continue
-        
-        # Extract networth using various patterns
-        nw_patterns = [
-            r'networth[^\d]*(\d+)',
-            r'net\s*worth[^\d]*(\d+)',
-            r'nw[^\d]*(\d+)',
-        ]
-        
-        for pattern in nw_patterns:
-            match = re.search(pattern, html_content, re.IGNORECASE)
-            if match and 100 <= int(match.group(1)) <= 100000:  # Reasonable networth range
-                game_data['networth'] = int(match.group(1))
-                break
-        
-        # Extract territory/acres
-        acres_patterns = [
-            r'(\d+)\s*acres',
-            r'territory[^\d]*(\d+)',
-            r'land[^\d]*(\d+)'
-        ]
-        
-        for pattern in acres_patterns:
-            match = re.search(pattern, html_content, re.IGNORECASE)
-            if match and 1 <= int(match.group(1)) <= 25000:  # Valid territory range
-                game_data['territory'] = int(match.group(1))
-                break
-        
-        return game_data
     
-    async def ensure_session(self) -> bool:
         """Ensure we have a valid session, attempt login if needed"""
         # Check if session is still valid
         if self._session_valid and (time.time() - self._last_successful_request) < SESSION_CHECK_INTERVAL:
@@ -1366,6 +1181,39 @@ class ApiClient:
         except Exception as e:
             log.error(f"API call failed: {e}")
             raise
+
+    def parse_game_data(self, html_content: str) -> Dict[str, Any]:
+        """Parse game data from HTML content using regex"""
+        data = {}
+        # Simple regex for key-value pairs like "Gold: 1,234"
+        patterns = {
+            'gold': r"Gold:\s*([\d,]+)",
+            'food': r"Food:\s*([\d,]+)",
+            'wood': r"Wood:\s*([\d,]+)",
+            'stone': r"Stone:\s*([\d,]+)",
+            'land': r"Land:\s*([\d,]+)",
+            'territory': r"Territory:\s*([\d,]+)\s*Acres",
+            'networth': r"Networth:\s*([\d,]+)",
+            'population': r"Population:\s*([\d,]+)",
+            'foot': r"Footmen:\s*([\d,]+)",
+            'archer': r"Archers:\s*([\d,]+)",
+            'cavalry': r"Cavalry:\s*([\d,]+)",
+            'siege': r"Siege Units:\s*([\d,]+)",
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, html_content, re.IGNORECASE)
+            if match:
+                value_str = match.group(1).replace(",", "")
+                try:
+                    data[key] = int(value_str)
+                except ValueError:
+                    log.warning(f"Could not parse value for {key}: {value_str}")
+
+        # Check for error messages
+        if re.search(r"not enough|insufficient|cannot build", html_content, re.IGNORECASE):
+            data['resource_error'] = True
+
+        return data
 
 # ---------- Actions ----------
 async def create_client() -> ApiClient:
@@ -1621,6 +1469,53 @@ async def attack_kingdom(
 
     return await api_client.api_call(endpoints_to_try[0], generic_params, method="POST")
 
+async def update_ai_state(api_client: ApiClient, ai_system: AdvancedAI):
+    """Fetch latest game state and update the AI's knowledge base."""
+    log.info("📊 Syncing AI state with the latest game data...")
+    try:
+        # Access a page that shows current resources, like overview
+        endpoint = f"{BASE_URL}/overview"
+        params = {"accountId": ACCOUNT_ID, "token": TOKEN, "kingdomId": KINGDOM_ID}
+
+        # We expect HTML content from this call. Use the raw client to avoid api_call logic which might parse JSON.
+        response = await api_client.client.get(endpoint, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+
+        html_content = response.text
+        game_data = api_client.parse_game_data(html_content)
+
+        if not game_data:
+            log.warning("Could not parse any game data from the overview page.")
+            return
+
+        # Update the AI's state
+        state = ai_system.state
+        state.resources['gold'] = game_data.get('gold', state.resources.get('gold', 0))
+        state.resources['food'] = game_data.get('food', state.resources.get('food', 0))
+        state.resources['wood'] = game_data.get('wood', state.resources.get('wood', 0))
+        state.resources['stone'] = game_data.get('stone', state.resources.get('stone', 0))
+
+        state.troops['foot'] = game_data.get('foot', state.troops.get('foot', 0))
+        state.troops['archer'] = game_data.get('archer', state.troops.get('archer', 0))
+        state.troops['cavalry'] = game_data.get('cavalry', state.troops.get('cavalry', 0))
+        state.troops['siege'] = game_data.get('siege', state.troops.get('siege', 0))
+
+        state.territory_size = game_data.get('territory', game_data.get('land', state.territory_size))
+        state.estimated_networth = game_data.get('networth', state.estimated_networth)
+
+        # Also update the estimated resources used for calculations, which might be different
+        state.estimated_resources['gold'] = game_data.get('gold', state.estimated_resources.get('gold', 100))
+        state.estimated_resources['wood'] = game_data.get('wood', state.estimated_resources.get('wood', 50))
+        state.estimated_resources['stone'] = game_data.get('stone', state.estimated_resources.get('stone', 50))
+        # This is the important one for building: free land
+        state.estimated_resources['land'] = state.territory_size - sum(state.buildings.values())
+
+
+        log.info(f"✅ AI state synchronized. Land: {state.territory_size}, Gold: {state.resources['gold']}, Troops: {sum(state.troops.values())}")
+
+    except Exception as e:
+        log.error(f"Failed to update AI state: {e}")
+
 # ---------- AI Intelligence System ----------
 @dataclass
 class GameState:
@@ -1875,6 +1770,45 @@ class AdvancedAI:
             # Balanced force - pick based on strategic need
             return random.choice(['foot', 'archer', 'cavalry', 'siege'])
 
+        def calculate_training_quantity(self, troop_type: str) -> int:
+        """Calculate how many troops to train - ULTRA CONSERVATIVE FOR EARLY GAME"""
+        base_cost = {
+            'foot': 50,
+            'archer': 75,
+            'cavalry': 150,
+            'siege': 300
+        }
+
+        # CRITICAL: Check if we had recent resource failures
+        if 'train' in self.state.recent_failures:
+            log.warning("🚨 Recent training failures - using MINIMAL quantities")
+            return 1  # Only train 1 at a time if we've had failures
+
+        # Use realistic resource estimates based on game phase
+        available_gold = self.state.estimated_resources.get('gold', 100)  # Changed from 1000 to 100
+        unit_cost = base_cost.get(troop_type, 50)
+
+        # EARLY GAME: Ultra conservative
+        if self.state.game_phase == 'early' or self.state.territory_size < 100:
+            # Use only 5% of gold for training in early game
+            max_affordable = max(1, (available_gold * 0.05) // unit_cost)
+            quantity = max(1, min(1, max_affordable))  # NEVER more than 1 in early game
+            log.info(f"�� ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
+
+        # MID GAME: Still conservative
+        elif self.state.game_phase == 'mid':
+            max_affordable = max(1, (available_gold * 0.15) // unit_cost)  # 15% of gold
+            quantity = max(1, min(2, max_affordable))  # Changed from 10 to 2
+            log.info(f"��️ MID GAME TRAINING: {quantity} {troop_type} troops")
+
+        # LATE GAME: More aggressive
+        else:
+            max_affordable = max(1, (available_gold * 0.25) // unit_cost)  # 25% of gold
+            quantity = max(1, min(5, max_affordable))  # Changed from 20 to 5
+            log.info(f"⚔️ LATE GAME TRAINING: {quantity} {troop_type} troops")
+
+        return quantity
+
     def calculate_exploration_troop_count(self) -> int:
         """Calculate optimal troop count for exploration - but check if we have troops first!"""
         total_troops = sum(self.state.troops.values())
@@ -1967,103 +1901,50 @@ class AdvancedAI:
         # Fallback to basic needs
         return random.choice(['Houses', 'Grain Farms', 'Barns', 'Markets'])
 
-    def calculate_training_quantity(self, troop_type: str) -> int:
-        """Calculate how many troops to train - ULTRA CONSERVATIVE FOR EARLY GAME"""
-        base_cost = {
-            'foot': 50,
-            'archer': 75,
-            'cavalry': 150,
-            'siege': 300
-        }
-
-        # CRITICAL: Check if we had recent resource failures
-        if 'train' in self.state.recent_failures:
-            log.warning("🚨 Recent training failures - using MINIMAL quantities")
-            return 1  # Only train 1 at a time if we've had failures
-
-        # Use realistic resource estimates based on game phase
-        available_gold = self.state.estimated_resources.get('gold', 100)
-        unit_cost = base_cost.get(troop_type, 50)
-
-        # EARLY GAME: Ultra conservative
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:
-            # Use only 5% of gold for training in early game
-            max_affordable = max(1, (available_gold * 0.05) // unit_cost) if unit_cost > 0 else float('inf')
-            quantity = max(1, min(1, max_affordable))
-            log.info(f"�� ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
-            
-        # MID GAME: Still conservative
-        elif self.state.game_phase == 'mid':
-            max_affordable = max(1, (available_gold * 0.15) // unit_cost) if unit_cost > 0 else float('inf')
-            quantity = max(1, min(2, max_affordable))
-            log.info(f"��️ MID GAME TRAINING: {quantity} {troop_type} troops")
-            
-        # LATE GAME: More aggressive
-        else:
-            max_affordable = max(1, (available_gold * 0.25) // unit_cost) if unit_cost > 0 else float('inf')
-            quantity = max(1, min(5, max_affordable))
-            log.info(f"⚔️ LATE GAME TRAINING: {quantity} {troop_type} troops")
-        
-        return int(quantity)
-
     def calculate_building_quantity(self, building_type: str) -> int:
-        """Calculate how many buildings to build, considering available free land."""
+        """Calculate how many buildings to build, considering available land."""
         base_cost = {
-            'Houses': 100,
-            'Grain Farms': 150,
-            'Barracks': 300,
-            'Archery Ranges': 250,
-            'Stables': 400,
-            'Markets': 150,
-            'Barns': 200,
-            'Castles': 1000,
-            'Temples': 600
+            'Houses': 100, 'Grain Farms': 150, 'Barracks': 300,
+            'Archery Ranges': 250, 'Stables': 400, 'Markets': 150,
+            'Barns': 200, 'Castles': 1000, 'Temples': 600
         }
-        
-        # CRITICAL: Check if we had recent resource failures
-        if 'build' in self.state.recent_failures:
-            log.warning("🚨 Recent building failures - using MINIMAL quantities")
-            return 1  # Only build 1 at a time if we've had failures
-
-        # Use realistic resource estimates based on game phase
-        available_gold = self.state.resources.get('gold', 100)
-        used_land = sum(self.state.buildings.values())
-        available_land = self.state.territory_size - used_land
-        available_wood = self.state.resources.get('wood', 50)
-        available_stone = self.state.resources.get('stone', 50)
         building_cost = base_cost.get(building_type, 100)
 
-        # EARLY GAME: Ultra conservative (current situation with ~1 land)
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:
-            # Can only build what we have land for
-            max_by_land = max(0, available_land)
-            max_by_gold = max(1, (available_gold * 0.1) // building_cost) if building_cost > 0 else float('inf')
-            max_by_wood = max(1, available_wood // 20) if available_wood > 20 else 0
-            max_by_stone = max(1, available_stone // 20) if available_stone > 20 else 0
-            
-            # Take the SMALLEST constraint
-            quantity = min(max_by_land, max_by_gold, max_by_wood, max_by_stone)
-            quantity = max(0, min(1, quantity)) # Build 0 or 1
-            
-            log.info(f"🌱 EARLY GAME BUILDING: {quantity} {building_type} (free land:{available_land}, gold:{available_gold}, wood:{available_wood}, stone:{available_stone})")
-            
-        # MID GAME: Still conservative
-        elif self.state.game_phase == 'mid':
-            max_by_land = max(0, available_land)
-            max_by_gold = max(1, (available_gold * 0.2) // building_cost) if building_cost > 0 else float('inf')
-            quantity = max(1, min(2, min(max_by_land, max_by_gold)))
-            log.info(f"🏗️ MID GAME BUILDING: {quantity} {building_type}")
-            
-        # LATE GAME: More aggressive
-        else:
-            max_by_land = max(0, available_land)
-            max_by_gold = max(1, (available_gold * 0.3) // building_cost) if building_cost > 0 else float('inf')
-            quantity = max(1, min(5, min(max_by_land, max_by_gold)))
-            log.info(f"⚔️ LATE GAME BUILDING: {quantity} {building_type}")
+        if 'build' in self.state.recent_failures:
+            log.warning("🚨 Recent building failures - using MINIMAL quantities")
+            return 1
 
+        # Correctly calculate available land
+        total_land = self.state.territory_size
+        occupied_land = sum(self.state.buildings.values())
+        free_land = total_land - occupied_land
+
+        if free_land <= 0:
+            log.warning(f"🚫 No free land available to build {building_type}. Total: {total_land}, Occupied: {occupied_land}")
+            return 0
+
+        available_gold = self.state.estimated_resources.get('gold', 100)
+
+        # Determine quantity based on game phase
+        if self.state.game_phase == 'early' or self.state.territory_size < 100:
+            max_by_gold = (available_gold * 0.1) // building_cost
+            quantity = min(free_land, max_by_gold)
+            quantity = max(0, min(1, quantity)) # Build at most 1
+            log.info(f"🌱 EARLY GAME BUILDING: {int(quantity)} {building_type} (Free Land: {free_land})")
+        elif self.state.game_phase == 'mid':
+            max_by_gold = (available_gold * 0.2) // building_cost
+            quantity = min(free_land, max_by_gold)
+            quantity = max(0, min(2, quantity)) # Build at most 2
+            log.info(f"🏗️ MID GAME BUILDING: {int(quantity)} {building_type} (Free Land: {free_land})")
+        else: # Late game
+            max_by_gold = (available_gold * 0.3) // building_cost
+            quantity = min(free_land, max_by_gold)
+            quantity = max(0, min(5, quantity)) # Build at most 5
+            log.info(f"⚔️ LATE GAME BUILDING: {int(quantity)} {building_type} (Free Land: {free_land})")
+            
         return int(quantity)
 
-    def decide_next_action(self) -> Dict[str, Any]:
+    d    def decide_next_action(self) -> Dict[str, Any]:
         """Decide what action to take next using AI logic - EXPLORATION FIRST STRATEGY"""
         self.state.action_count += 1
 
@@ -2461,1302 +2342,6 @@ class AdvancedAI:
                 self.state.recent_failures.pop(0)
             raise
 
-    async def _autonomous_game_ai(self, page):
-        """Fully autonomous AI that explores all game pages and makes strategic decisions"""
-        try:
-            log.info("🧠 AUTONOMOUS AI MODE ACTIVATED - Bot will explore and make its own decisions")
-
-            # Define all available game pages from user's map
-            game_pages = {
-                "overview": f"{BASE_URL}/overview",
-                "warroom": f"{BASE_URL}/warroom",
-                "warroom_explore": f"{BASE_URL}/warroom?action=explore",
-                "buildings": f"{BASE_URL}/buildings",
-                "guildhall": f"{BASE_URL}/guildhall",
-                "holycircle": f"{BASE_URL}/holycircle",
-                "embassy": f"{BASE_URL}/embassy",
-                "settlements": f"{BASE_URL}/settlements",
-                "rankings": f"{BASE_URL}/rankings",
-                "research": f"{BASE_URL}/research",
-                "messages": f"{BASE_URL}/messages"
-            }
-
-            # Strategic priorities for the AI
-            ai_priorities = [
-                "build_economy",      # Focus on resource generation
-                "train_military",     # Build army strength
-                "expand_territory",   # Gain more land
-                "research_tech",      # Unlock new capabilities
-                "diplomacy",          # Manage relationships
-                "intelligence"        # Gather information
-            ]
-
-            # Main autonomous loop
-            for cycle in range(10):  # Run for 10 decision cycles
-                log.info(f"🧠 === AI DECISION CYCLE {cycle + 1} ===")
-
-                # Phase 1: Gather intelligence from all pages
-                game_state = await self._analyze_all_pages(page, game_pages)
-
-                # CRITICAL: Store game state for smart calculations during form filling
-                self.latest_game_state = game_state
-                self.state.resources = game_state.get("resources", self.state.resources)
-                self.state.buildings = game_state.get("buildings", {}).get("current", self.state.buildings)
-                self.state.troops = game_state.get("military", {}).get("troops", self.state.troops)
-                if "land" in game_state.get("resources", {}):
-                    self.state.territory_size = game_state["resources"]["land"]
-
-                log.info(f"💾 Stored game state with {len(self.state.resources)} resources, {len(self.state.troops)} troop types, and {self.state.territory_size} land.")
-
-                # Phase 2: Make strategic decision based on game state
-                best_action = await self._make_strategic_decision(game_state, ai_priorities)
-
-                # Phase 3: Execute the chosen action
-                success = await self._execute_autonomous_action(page, best_action, game_pages)
-
-                if success:
-                    log.info(f"✅ Autonomous action completed: {best_action['action']}")
-                else:
-                    log.warning(f"⚠️ Autonomous action failed: {best_action['action']}")
-
-                # Wait before next decision cycle
-                wait_time = random.randint(30, 120)  # 30-120 seconds between decisions
-                log.info(f"🧠 AI thinking... waiting {wait_time} seconds before next decision")
-                await page.wait_for_timeout(wait_time * 1000)
-
-            log.info("🧠 Autonomous AI session completed!")
-            return True
-
-        except Exception as e:
-            log.error(f"❌ Autonomous AI failed: {e}")
-            return False
-
-    async def _analyze_all_pages(self, page, game_pages):
-        """Visit all game pages and analyze what's available"""
-        game_state = {
-            "resources": {},
-            "military": {},
-            "buildings": {},
-            "opportunities": [],
-            "current_status": {},
-            "threats": []
-        }
-
-        log.info("🔍 AI analyzing all game pages for opportunities...")
-
-        for page_name, page_url in game_pages.items():
-            try:
-                log.info(f"🔍 AI visiting {page_name}: {page_url}")
-                await page.goto(page_url)
-                await page.wait_for_timeout(3000)
-
-                # Take screenshot for analysis
-                screenshot_path = f"ai_analysis_{page_name}.png"
-                await page.screenshot(path=screenshot_path)
-
-                # Get page content
-                page_text = await page.content()
-                page_title = await page.title()
-
-                # Analyze page for opportunities
-                opportunities = await self._find_page_opportunities(page, page_name, page_text)
-                game_state["opportunities"].extend(opportunities)
-
-                # Extract key information based on page type
-                if page_name == "overview":
-                    await self._extract_overview_data(page_text, game_state)
-                elif "warroom" in page_name:
-                    await self._extract_military_data(page_text, game_state)
-                elif page_name == "buildings":
-                    await self._extract_building_data(page_text, game_state)
-                elif page_name == "research":
-                    await self._extract_research_data(page_text, game_state)
-
-                log.info(f"✅ AI analyzed {page_name} - found {len(opportunities)} opportunities")
-
-            except Exception as e:
-                log.warning(f"⚠️ AI failed to analyze {page_name}: {e}")
-                continue
-
-        log.info(f"🧠 AI analysis complete - found {len(game_state['opportunities'])} total opportunities")
-        return game_state
-
-    async def _find_page_opportunities(self, page, page_name, page_text):
-        """Find actionable opportunities on a page"""
-        opportunities = []
-
-        # Get all visible, clickable elements only
-        clickable_elements = await page.query_selector_all('button:visible, a[href]:visible, input[type="submit"]:visible, [onclick]:visible')
-
-        for element in clickable_elements:
-            try:
-                # Double-check visibility
-                is_visible = await element.is_visible()
-                if not is_visible:
-                    continue
-
-                text = await element.inner_text()
-                if text and len(text.strip()) > 0:
-                    # Classify opportunity type
-                    opportunity_type = self._classify_opportunity(text.strip(), page_name)
-                    if opportunity_type:
-                        opportunities.append({
-                            "page": page_name,
-                            "type": opportunity_type,
-                            "text": text.strip(),
-                            # Remove element reference - we'll find it fresh when executing
-                            "priority": self._calculate_opportunity_priority(opportunity_type, text)
-                        })
-            except:
-                continue
-
-        return opportunities
-
-    def _classify_opportunity(self, text, page_name):
-        """Classify what type of opportunity an action represents"""
-        text_lower = text.lower()
-
-        # Skip navigation links - focus on actual game actions
-        navigation_words = ['buildings', 'warroom', 'guildhall', 'embassy', 'overview', 'rankings', 'messages', 'settings', 'logout', 'research', 'settlements', 'holycircle']
-        if any(nav_word in text_lower for nav_word in navigation_words):
-            return None  # Ignore navigation links
-
-        # Skip common UI elements that aren't game actions
-        ui_elements = ['home', 'menu', 'back', 'cancel', 'close', 'help', 'info', 'about']
-        if any(ui_word in text_lower for ui_word in ui_elements):
-            return None
-
-        # Economic opportunities - look for specific action words
-        if any(word in text_lower for word in ['build', 'construct', 'upgrade', 'buy', 'purchase', 'spend', 'invest']):
-            return "economic"
-
-        # Military opportunities - look for training/military actions
-        if any(word in text_lower for word in ['train', 'recruit', 'attack', 'defend', 'hire', 'enlist']):
-            return "military"
-
-        # Expansion opportunities - look for exploration actions
-        if any(word in text_lower for word in ['explore', 'expand', 'patrol', 'venture', 'search']):
-            return "expansion"
-
-        # Research opportunities - look for research actions
-        if any(word in text_lower for word in ['study', 'learn', 'advance', 'develop', 'discover']):
-            return "research"
-
-        # Diplomatic opportunities - look for diplomatic actions
-        if any(word in text_lower for word in ['alliance', 'treaty', 'negotiate', 'diplomacy', 'send message', 'offer']):
-            return "diplomatic"
-
-        # Intelligence opportunities - look for spy actions
-        if any(word in text_lower for word in ['spy', 'infiltrate', 'recon', 'intelligence', 'gather info']):
-            return "intelligence"
-
-        return None
-
-    def _calculate_opportunity_priority(self, opportunity_type, text):
-        """Calculate priority score for an opportunity"""
-        base_priorities = {
-            "economic": 8,      # High priority - need resources
-            "military": 7,      # High priority - need defense
-            "expansion": 6,     # Medium-high - need territory
-            "research": 5,      # Medium - long term benefits
-            "intelligence": 4,  # Medium-low - information gathering
-            "diplomatic": 3     # Low - nice to have
-        }
-
-        priority = base_priorities.get(opportunity_type, 1)
-
-        # Boost priority for certain keywords
-        text_lower = text.lower()
-        if any(word in text_lower for word in ['free', 'bonus', 'reward', 'special']):
-            priority += 3
-        if any(word in text_lower for word in ['urgent', 'limited', 'expire']):
-            priority += 2
-
-        return priority
-
-    async def _make_strategic_decision(self, game_state, ai_priorities):
-        """AI makes strategic decision about what to do next"""
-        global completed_actions, action_history
-
-        log.info("🧠 AI making strategic decision...")
-
-        # STRATEGIC PRIORITIZATION - Early game focus on exploration for fast land gain
-        resources = game_state.get("resources", {})
-        military = game_state.get("military", {})
-        current_land = resources.get("land", 50)
-        total_troops = sum(military.get("troops", {}).values()) if military.get("troops") else 0
-
-        log.info(f"🎯 Strategic analysis: {current_land} land, {total_troops} troops")
-
-        # Boost exploration priority in early game
-        for opp in game_state["opportunities"]:
-            if opp["type"] == "expansion" and current_land < 300:
-                opp["priority"] += 50  # Major boost for early exploration
-                log.info(f"🚀 BOOSTED exploration priority for early game (land: {current_land})")
-            elif opp["type"] == "economic" and 300 <= current_land < 800:
-                opp["priority"] += 30  # Boost building in mid game
-                log.info(f"🏗️ BOOSTED building priority for mid game (land: {current_land})")
-            elif opp["type"] == "military" and total_troops < 100:
-                opp["priority"] += 25  # Need troops for exploration
-                log.info(f"🗡️ BOOSTED training priority (low troops: {total_troops})")
-
-        # Sort opportunities by priority (including strategic boosts)
-        opportunities = sorted(game_state["opportunities"], key=lambda x: x["priority"], reverse=True)
-
-        if not opportunities:
-            log.warning("⚠️ AI found no opportunities - will explore randomly")
-            return {"action": "random_exploration", "page": "overview"}
-
-        # Filter out recently completed actions for variety
-        available_opportunities = []
-        for opp in opportunities:
-            action_key = f"{opp['page']}_{opp['text']}"
-            if action_key not in completed_actions:
-                available_opportunities.append(opp)
-
-        if not available_opportunities:
-            log.info("🔄 All opportunities completed, clearing history for new cycle")
-            completed_actions.clear()  # Reset for new cycle
-            action_history.clear()
-            available_opportunities = opportunities
-
-        # Add some variety - don't always pick the highest priority
-        if len(available_opportunities) > 1 and random.random() < 0.3:  # 30% chance
-            # Pick from top 3 options for variety
-            top_options = available_opportunities[:min(3, len(available_opportunities))]
-            best_opportunity = random.choice(top_options)
-            log.info(f"🎲 AI chose variety option instead of highest priority")
-        else:
-            best_opportunity = available_opportunities[0]
-
-        log.info(f"🎯 AI decided on: {best_opportunity['type']} action - '{best_opportunity['text']}' on {best_opportunity['page']} page (priority: {best_opportunity['priority']})")
-
-        # Track this action
-        action_key = f"{best_opportunity['page']}_{best_opportunity['text']}"
-        completed_actions.add(action_key)
-        action_history.append(action_key)
-
-        # Keep only recent 20 actions in history
-        if len(action_history) > 20:
-            action_history.pop(0)
-
-        return {
-            "action": best_opportunity["type"],
-            "page": best_opportunity["page"],
-            "text": best_opportunity["text"],
-            # Remove stale element reference
-            "opportunity": best_opportunity
-        }
-
-    async def _execute_autonomous_action(self, page, action, game_pages):
-        """Execute the AI's chosen action"""
-        try:
-            log.info(f"🎯 AI executing {action['action']} on {action['page']} page")
-
-            # Navigate to the correct page
-            page_url = game_pages.get(action['page'])
-            if page_url:
-                await page.goto(page_url)
-                await page.wait_for_timeout(3000)
-
-            # Always find element fresh by its text (no stale elements!)
-            action_text = action.get('text', '')
-            if action_text:
-                log.info(f"🔍 AI re-finding element with text: '{action_text}'")
-
-                # Try multiple strategies to find the element
-                found_element = None
-
-                # Strategy 1: Find by exact text match (only visible elements)
-                try:
-                    elements = await page.query_selector_all('button:visible, a[href]:visible, input[type="submit"]:visible, [onclick]:visible')
-                    for element in elements:
-                        try:
-                            # Double check visibility
-                            is_visible = await element.is_visible()
-                            if not is_visible:
-                                continue
-
-                            text = await element.inner_text()
-                            if text and text.strip() == action_text:
-                                found_element = element
-                                log.info(f"✅ Found visible element by exact text match")
-                                break
-                        except:
-                            continue
-                except:
-                    pass
-
-                # Strategy 2: Find by partial text match (only visible elements)
-                if not found_element:
-                    try:
-                        elements = await page.query_selector_all('button:visible, a[href]:visible, input[type="submit"]:visible, [onclick]:visible')
-                        for element in elements:
-                            try:
-                                # Double check visibility
-                                is_visible = await element.is_visible()
-                                if not is_visible:
-                                    continue
-
-                                text = await element.inner_text()
-                                if text and action_text.lower() in text.lower():
-                                    found_element = element
-                                    log.info(f"✅ Found visible element by partial text match")
-                                    break
-                            except:
-                                continue
-                    except:
-                        pass
-
-                # Strategy 3: Use Playwright's text selector
-                if not found_element:
-                    try:
-                        # Try various text-based selectors
-                        text_selectors = [
-                            f'text="{action_text}"',
-                            f'text={action_text}',
-                            f':has-text("{action_text}")',
-                            f'button:has-text("{action_text}")',
-                            f'a:has-text("{action_text}")'
-                        ]
-
-                        for selector in text_selectors:
-                            try:
-                                found_element = await page.wait_for_selector(selector, timeout=2000)
-                                if found_element:
-                                    log.info(f"✅ Found element using selector: {selector}")
-                                    break
-                            except:
-                                continue
-                    except:
-                        pass
-
-                if found_element:
-                    # Comprehensive element interaction with multiple strategies
-                    try:
-                        # Strategy 1: Scroll element into view
-                        log.info(f"🔄 Scrolling element into view: '{action_text}'")
-                        await found_element.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(1000)  # Wait for scroll animation
-
-                        # Strategy 2: Check if element is really visible and enabled
-                        is_visible = await found_element.is_visible()
-                        is_enabled = await found_element.is_enabled()
-
-                        if not is_visible:
-                            log.warning(f"⚠️ Element not visible after scroll: '{action_text}'")
-                            # Try to make it visible by clicking parent or removing overlays
-                            try:
-                                # Remove common overlay elements
-                                await page.evaluate("""
-                                    // Remove common modal/overlay elements
-                                    document.querySelectorAll('.modal, .overlay, .popup, [style*="z-index"]').forEach(el => {
-                                        if (el.style.zIndex > 100) el.remove();
-                                    });
-                                """)
-                                await page.wait_for_timeout(500)
-                                is_visible = await found_element.is_visible()
-                            except:
-                                pass
-
-                        if not is_enabled:
-                            log.warning(f"⚠️ Element not enabled: '{action_text}'")
-
-                        # Strategy 3: Multiple click attempts
-                        click_success = False
-
-                        if is_visible and is_enabled:
-                            # Attempt 1: Normal click
-                            try:
-                                log.info(f"🖱️ Attempting normal click on: '{action_text}'")
-                                await found_element.click(timeout=5000)
-                                click_success = True
-                                log.info(f"✅ Normal click successful: '{action_text}'")
-                            except Exception as e:
-                                log.warning(f"⚠️ Normal click failed: {e}")
-
-                        if not click_success:
-                            # Attempt 2: Force click with coordinates
-                            try:
-                                log.info(f"🎯 Attempting coordinate click on: '{action_text}'")
-                                box = await found_element.bounding_box()
-                                if box:
-                                    x = box['x'] + box['width'] / 2
-                                    y = box['y'] + box['height'] / 2
-                                    await page.mouse.click(x, y)
-                                    click_success = True
-                                    log.info(f"✅ Coordinate click successful: '{action_text}'")
-                            except Exception as e:
-                                log.warning(f"⚠️ Coordinate click failed: {e}")
-
-                        if not click_success:
-                            # Attempt 3: JavaScript click
-                            try:
-                                log.info(f"⚡ Attempting JavaScript click on: '{action_text}'")
-                                await page.evaluate("(element) => element.click()", found_element)
-                                click_success = True
-                                log.info(f"✅ JavaScript click successful: '{action_text}'")
-                            except Exception as e:
-                                log.warning(f"⚠️ JavaScript click failed: {e}")
-
-                        if not click_success:
-                            # Attempt 4: Dispatch click event
-                            try:
-                                log.info(f"📡 Attempting event dispatch on: '{action_text}'")
-                                await found_element.dispatch_event('click')
-                                click_success = True
-                                log.info(f"✅ Event dispatch successful: '{action_text}'")
-                            except Exception as e:
-                                log.warning(f"⚠️ Event dispatch failed: {e}")
-
-                        if click_success:
-                            # Wait and take screenshot of result
-                            await page.wait_for_timeout(3000)
-                            await page.screenshot(path=f"ai_action_result_{action['action']}.png")
-
-                            # Look for confirmation or next steps
-                            await self._handle_action_followup(page, action)
-
-                            return True
-                        else:
-                            log.error(f"❌ All click strategies failed for: '{action_text}'")
-                            await page.screenshot(path=f"ai_all_click_strategies_failed_{action['action']}.png")
-                            return False
-
-                    except Exception as interaction_error:
-                        log.error(f"❌ Element interaction failed for '{action_text}': {interaction_error}")
-                        await page.screenshot(path=f"ai_interaction_error_{action['action']}.png")
-                        return False
-                else:
-                    log.error(f"❌ Could not re-find element with text: '{action_text}'")
-                    await page.screenshot(path=f"ai_failed_to_find_{action['action']}.png")
-                    return False
-            else:
-                log.warning(f"⚠️ No text available to find element for action: {action['action']}")
-                return False
-
-        except Exception as e:
-            log.error(f"❌ AI failed to execute action {action['action']}: {e}")
-            return False
-
-    async def _handle_action_followup(self, page, action):
-        """Handle any follow-up actions needed after clicking - HANDLES MISSING QUANTITY FIELDS"""
-        try:
-            await page.wait_for_timeout(2000)  # Wait for page changes
-            await page.screenshot(path=f"ai_followup_start_{action['action']}.png")
-
-            # Find ALL input types - text, number, select, hidden, etc.
-            all_inputs = await page.query_selector_all('input, select, textarea')
-
-            if not all_inputs:
-                log.info("🔍 No input fields found - action may be complete")
-                return
-
-            log.info(f"🎯 AI found {len(all_inputs)} input fields, filling intelligently...")
-
-            # DETAILED FIELD ANALYSIS
-            log.info(f"🎯 DETAILED FIELD ANALYSIS:")
-            for i, input_field in enumerate(all_inputs):
-                try:
-                    name = await input_field.get_attribute('name') or f'field_{i}'
-                    field_type = await input_field.get_attribute('type') or 'unknown'
-                    tag = await input_field.evaluate('el => el.tagName.toLowerCase()')
-                    placeholder = await input_field.get_attribute('placeholder') or ''
-                    value = await input_field.get_attribute('value') or ''
-                    is_visible = await input_field.is_visible()
-
-                    log.info(f"  {i+1}. {tag}[{field_type}] name='{name}' placeholder='{placeholder}' value='{value}' visible={is_visible}")
-                except Exception as e:
-                    log.info(f"  {i+1}. [error reading field: {e}]")
-
-            filled_count = 0
-            for i, input_field in enumerate(all_inputs):
-                try:
-                    input_name = await input_field.get_attribute('name') or ""
-                    input_type = await input_field.get_attribute('type') or ""
-                    input_id = await input_field.get_attribute('id') or ""
-                    tag_name = await input_field.evaluate('el => el.tagName.toLowerCase()')
-
-                    # Skip disabled or readonly fields
-                    is_disabled = await input_field.evaluate('el => el.disabled')
-                    is_readonly = await input_field.evaluate('el => el.readOnly')
-                    if is_disabled or is_readonly:
-                        continue
-
-                    field_identifier = f"{input_name or input_id or f'field_{i}'}"
-                    log.info(f"🔍 Processing {tag_name} field: {field_identifier} (type: {input_type})")
-
-                    # Handle different field types
-                    if tag_name == 'select':
-                        filled = await self._handle_select_field(input_field, field_identifier, action)
-                    elif input_type in ['number', 'text', '']:
-                        filled = await self._handle_number_field(input_field, field_identifier, action, input_name, input_id)
-                    elif input_type == 'hidden':
-                        filled = await self._handle_hidden_field(input_field, field_identifier, action)
-                    elif tag_name == 'textarea':
-                        filled = await self._handle_textarea_field(input_field, field_identifier, action)
-                    else:
-                        log.info(f"⚠️ Skipping unsupported field type: {input_type}")
-                        continue
-
-                    if filled:
-                        filled_count += 1
-                        await page.wait_for_timeout(500)  # Small delay between fills
-
-                except Exception as field_error:
-                    log.warning(f"⚠️ Failed to fill field {i}: {field_error}")
-                    continue
-
-            log.info(f"✅ AI filled {filled_count} fields successfully")
-            await page.screenshot(path=f"ai_followup_filled_{action['action']}.png")
-
-            # CRITICAL: If no quantity field was found, try to find it after form changes
-            if filled_count == 0 or (filled_count == 1 and any('select' in str(field) for field in all_inputs)):
-                log.info("🎯 No quantity field found - checking for dynamic fields after selection...")
-                await page.wait_for_timeout(2000)  # Wait for any dynamic content
-
-                # Look for new fields that might have appeared
-                new_inputs = await page.query_selector_all('input, select, textarea')
-                if len(new_inputs) > len(all_inputs):
-                    log.info(f"🎯 Found {len(new_inputs) - len(all_inputs)} new fields after selection!")
-
-                    # Process the new fields
-                    for i, input_field in enumerate(new_inputs[len(all_inputs):]):
-                        try:
-                            input_type = await input_field.get_attribute('type')
-                            if input_type == 'number':
-                                # This is likely the quantity field!
-                                if 'military' in action['action']:
-                                    value = random.randint(200, 1000)
-                                elif 'economic' in action['action']:
-                                    value = random.randint(50, 500)
-                                else:
-                                    value = random.randint(100, 300)
-
-                                await input_field.fill(str(value))
-                                log.info(f"🎯 FOUND DYNAMIC QUANTITY FIELD: {value}")
-                                filled_count += 1
-                                break
-                        except:
-                            continue
-
-            # Force fill ANY number field as quantity if we still haven't filled any
-            if filled_count == 0:
-                log.info("🎯 No fields filled yet - looking for ANY number field to use as quantity")
-                for input_field in all_inputs:
-                    try:
-                        field_type = await input_field.get_attribute('type')
-                        if field_type == 'number':
-                            # Force fill this as quantity
-                            if 'military' in action['action']:
-                                value = random.randint(200, 1000)
-                            elif 'economic' in action['action']:
-                                value = random.randint(50, 500)
-                            else:
-                                value = random.randint(100, 300)
-
-                            await input_field.fill(str(value))
-                            log.info(f"🎯 FORCE FILLED number field as quantity: {value}")
-                            filled_count += 1
-                            break
-                    except:
-                        continue
-
-            # If STILL no quantity field, try clicking multiple times to trigger quantity field
-            if filled_count == 0:
-                log.info("🎯 Still no quantity field - trying to trigger it with multiple clicks...")
-                try:
-                    # Look for any buttons that might trigger quantity fields
-                    trigger_buttons = await page.query_selector_all('button, a, [onclick]')
-                    for button in trigger_buttons:
-                        try:
-                            text = await button.inner_text()
-                            if any(word in text.lower() for word in ['quantity', 'amount', 'how many', 'number']):
-                                await button.click()
-                                await page.wait_for_timeout(1000)
-                                log.info(f"🎯 Clicked potential quantity trigger: {text}")
-                                break
-                        except:
-                            continue
-                except:
-                    pass
-
-            # Find and click submit buttons with comprehensive selectors
-            submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("Submit")',
-                'button:has-text("Confirm")',
-                'button:has-text("Build")',
-                'button:has-text("Train")',
-                'button:has-text("Attack")',
-                'button:has-text("Explore")',
-                'button:has-text("Research")',
-                'button:has-text("Send")',
-                'button:has-text("Buy")',
-                'button:has-text("Purchase")',
-                'button:has-text("Execute")',
-                'button:has-text("Go")',
-                'button:has-text("Start")',
-                'button:has-text("Create")',
-                'button[onclick*="submit"]',
-                'input[onclick*="submit"]',
-                '.submit-btn',
-                '.btn-primary',
-                '.btn-submit'
-            ]
-
-            submit_button = None
-            for selector in submit_selectors:
-                try:
-                    buttons = await page.query_selector_all(selector)
-                    for button in buttons:
-                        is_visible = await button.is_visible()
-                        if is_visible:
-                            submit_button = button
-                            log.info(f"✅ Found submit button with selector: {selector}")
-                            break
-                    if submit_button:
-                        break
-                except:
-                    continue
-
-            if submit_button:
-                try:
-                    # Multiple click strategies for submit button
-                    await submit_button.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(1000)
-
-                    # Try normal click first
-                    try:
-                        await submit_button.click(timeout=5000)
-                        log.info("✅ AI clicked submit button (normal click)")
-                    except:
-                        # Try coordinate click
-                        try:
-                            box = await submit_button.bounding_box()
-                            if box:
-                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                                log.info("✅ AI clicked submit button (coordinate click)")
-                        except:
-                            # Try JavaScript click
-                            await page.evaluate('(button) => button.click()', submit_button)
-                            log.info("✅ AI clicked submit button (JavaScript click)")
-
-                    await page.wait_for_timeout(3000)  # Wait for submission
-                    await page.screenshot(path=f"ai_followup_submitted_{action['action']}.png")
-
-                except Exception as click_error:
-                    log.error(f"❌ Failed to click submit button: {click_error}")
-            else:
-                log.warning("⚠️ No submit button found - form may auto-submit or action may be complete")
-
-        except Exception as e:
-            log.error(f"❌ Follow-up handling failed: {e}")
-            await page.screenshot(path=f"ai_followup_error_{action['action']}.png")
-
-    async def _handle_select_field(self, select_field, field_name, action):
-        """Handle dropdown/select fields"""
-        try:
-            options = await select_field.query_selector_all('option')
-            if len(options) <= 1:
-                return False
-
-            # Skip first option (usually empty/placeholder)
-            selected_option = None
-
-            if 'military' in action['action'] or 'train' in field_name.lower():
-                # For military actions, prefer troops
-                for option in options[1:]:
-                    text = await option.inner_text()
-                    if any(word in text.lower() for word in ['foot', 'archer', 'cavalry', 'soldier', 'troop']):
-                        selected_option = option
-                        break
-            elif 'economic' in action['action'] or 'build' in field_name.lower():
-                # For economic actions, prefer buildings
-                for option in options[1:]:
-                    text = await option.inner_text()
-                    if any(word in text.lower() for word in ['house', 'farm', 'market', 'mine', 'building']):
-                        selected_option = option
-                        break
-
-            # Default to random option if no specific match
-            if not selected_option and len(options) > 1:
-                selected_option = random.choice(options[1:])
-
-            if selected_option:
-                option_value = await selected_option.get_attribute('value')
-                option_text = await selected_option.inner_text()
-                await select_field.select_option(value=option_value)
-                log.info(f"🎯 AI selected '{option_text}' in {field_name}")
-                return True
-
-        except Exception as e:
-            log.warning(f"⚠️ Failed to handle select field {field_name}: {e}")
-        return False
-
-
-
-
-    async def _handle_number_field(self, input_field, field_name, action, input_name, input_id):
-        """Handle number and text input fields - ULTRA-CONSERVATIVE RESOURCE AWARE"""
-        try:
-            field_lower = f"{field_name} {input_name} {input_id}".lower()
-            # ...
-
-
-
-
-            # Check if this is ANY kind of quantity field
-            is_quantity_field = any(word in field_lower for word in [
-                'quantity', 'amount', 'count', 'num', 'qty', 'number', 'how', 'many'
-            ])
-
-            # Also check if it's a number input with no specific name (often quantity fields)
-            is_number_input = await input_field.get_attribute('type') == 'number'
-            is_text_input = await input_field.get_attribute('type') in ['text', '']
-
-            # If it's a quantity field, get CURRENT resources from the page RIGHT NOW
-            if is_quantity_field or (is_number_input and not input_name) or (is_text_input and not input_name):
-                # CRITICAL: Get current page to extract available resources
-                page = input_field.page if hasattr(input_field, 'page') else None
-                available_resources = {}
-
-                if page:
-                    available_resources = await self._extract_available_resources(page)
-                    log.info(f"🎯 EXTRACTED REAL-TIME RESOURCES: {available_resources}")
-                else:
-                    log.warning("⚠️ No page available, using ULTRA-CONSERVATIVE fallbacks")
-                    available_resources = {'gold': 100, 'wood': 50, 'stone': 50, 'food': 50, 'land': 1}
-
-                if 'military' in action['action'] or 'train' in field_lower:
-                    # Calculate ULTRA-CONSERVATIVE troop training based on CURRENT available gold
-                    available_gold = available_resources.get('gold', 100)
-                    troop_cost = 75  # Average cost per troop
-                    max_affordable = max(1, available_gold // troop_cost)
-
-                    # Train 1-3 troops maximum, never more
-                    value = max(1, min(3, max_affordable // 4))
-                    log.info(f"🗡️ ULTRA-CONSERVATIVE TRAINING: {value} troops (can afford {max_affordable}, have {available_gold} gold)")
-
-                elif 'economic' in action['action'] or 'build' in field_lower:
-                    # Calculate ULTRA-CONSERVATIVE building based on CURRENT available resources
-                    available_gold = available_resources.get('gold', 100)
-                    available_land = available_resources.get('land', 1)
-                    available_wood = available_resources.get('wood', 50)
-                    available_stone = available_resources.get('stone', 50)
-
-                    building_cost = 150  # Average cost per building
-
-                    # CRITICAL: Check all resource constraints
-                    max_by_land = available_land
-                    max_by_gold = max(1, available_gold // building_cost)
-                    max_by_wood = max(1, available_wood // 10)  # Assume 10 wood per building
-                    max_by_stone = max(1, available_stone // 10)  # Assume 10 stone per building
-
-                    # Take the SMALLEST constraint (most limiting resource)
-                    value = min(max_by_land, max_by_gold, max_by_wood, max_by_stone)
-                    value = max(1, min(1, value))  # Build 1 building maximum
-
-                    log.info(f"🏗️ ULTRA-CONSERVATIVE BUILDING: {value} buildings (limited by land:{available_land}, gold:{available_gold}, wood:{available_wood}, stone:{available_stone})")
-
-                elif 'expansion' in action['action']:
-                    # Conservative exploration - we don't have troop count from this page
-                    value = 1  # Send only 1 troop for exploration
-                    log.info(f"🗺️ ULTRA-CONSERVATIVE EXPLORATION: {value} troop")
-
-                else:
-                    # Default very conservative amount for unknown actions
-                    value = 1
-                    log.info(f"�� ULTRA-CONSERVATIVE: {value} (unknown action type)")
-
-                await input_field.fill(str(value))
-                log.info(f"✅ ULTRA-CONSERVATIVE FILLED: {field_name} = {value}")
-                return True
-
-
-
-            # Price/Cost fields
-            elif any(word in field_lower for word in ['price', 'cost', 'gold', 'money']):
-                price = 50  # Conservative prices
-                await input_field.fill(str(price))
-                log.info(f"�� Filled {field_name} price: {price}")
-                return True
-
-            # Generic text fields
-            else:
-                placeholder = await input_field.get_attribute('placeholder') or ""
-                if placeholder:
-                    await input_field.fill(placeholder[:10])
-                    log.info(f"�� Filled {field_name} with placeholder text")
-                    return True
-                elif is_number_input or is_text_input:
-                    # Ultra-conservative default for unknown fields
-                    value = 1
-                    await input_field.fill(str(value))
-                    log.info(f"�� ULTRA-CONSERVATIVE FILL: {field_name} = {value}")
-                    return True
-
-        except Exception as e:
-            log.warning(f"⚠️ Failed to handle number field {field_name}: {e}")
-        return False
-
-    async def _handle_hidden_field(self, input_field, field_name, action):
-        """Handle hidden fields - usually contain required IDs/tokens"""
-        try:
-            current_value = await input_field.get_attribute('value') or ""
-            if not current_value:
-                # Fill with our known values if field names match
-                field_lower = field_name.lower()
-                if 'kingdom' in field_lower and 'id' in field_lower:
-                    await input_field.fill(str(KINGDOM_ID))
-                    log.info(f"🎯 AI filled hidden {field_name} with kingdom ID")
-                    return True
-                elif 'account' in field_lower and 'id' in field_lower:
-                    await input_field.fill(str(ACCOUNT_ID))
-                    log.info(f"🎯 AI filled hidden {field_name} with account ID")
-                    return True
-                elif 'token' in field_lower:
-                    await input_field.fill(TOKEN)
-                    log.info(f"🎯 AI filled hidden {field_name} with token")
-                    return True
-        except Exception as e:
-            log.warning(f"⚠️ Failed to handle hidden field {field_name}: {e}")
-        return False
-
-    async def _handle_textarea_field(self, textarea_field, field_name, action):
-        """Handle textarea fields - usually for messages"""
-        try:
-            if 'diplomatic' in action['action'] or 'message' in field_name.lower():
-                messages = [
-                    "Greetings from our kingdom!",
-                    "Let us discuss trade opportunities.",
-                    "We propose a mutually beneficial alliance.",
-                    "Your kingdom seems strong - we respect that.",
-                    "Perhaps we can avoid conflict through diplomacy."
-                ]
-                message = random.choice(messages)
-                await textarea_field.fill(message)
-                log.info(f"🎯 AI filled {field_name} with diplomatic message")
-                return True
-        except Exception as e:
-            log.warning(f"⚠️ Failed to handle textarea field {field_name}: {e}")
-        return False
-
-    async def _extract_available_resources(self, page):
-        """Extract available resources and land from the current page"""
-        try:
-            # Get page content to parse resources
-            page_content = await page.content()
-
-            # Look for resource indicators in the HTML - CRITICAL PATTERNS FROM GAME UI
-            resource_patterns = {
-                'gold': [
-                    r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?gold',
-                    r'gold[^\d]*(\d+(?:,\d+)*)',
-                    r'money[^\d]*(\d+(?:,\d+)*)',
-                    r'(\d+)\s*gold',  # Simple pattern
-                    r'gold:\s*(\d+)',  # Colon pattern
-                    r'gold\s*=\s*(\d+)'  # Equals pattern
-                ],
-                'food': [
-                    r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?food',
-                    r'food[^\d]*(\d+(?:,\d+)*)',
-                    r'grain[^\d]*(\d+(?:,\d+)*)',
-                    r'(\d+)\s*food',
-                    r'food:\s*(\d+)',
-                    r'food\s*=\s*(\d+)'
-                ],
-                'wood': [
-                    r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?wood',
-                    r'wood[^\d]*(\d+(?:,\d+)*)',
-                    r'lumber[^\d]*(\d+(?:,\d+)*)',
-                    r'(\d+)\s*wood',
-                    r'wood:\s*(\d+)',
-                    r'wood\s*=\s*(\d+)'
-                ],
-                'stone': [
-                    r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?stone',
-                    r'stone[^\d]*(\d+(?:,\d+)*)',
-                    r'rock[^\d]*(\d+(?:,\d+)*)',
-                    r'(\d+)\s*stone',
-                    r'stone:\s*(\d+)',
-                    r'stone\s*=\s*(\d+)'
-                ],
-                'land': [
-                    r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?land',
-                    r'land[^\d]*(\d+(?:,\d+)*)',
-                    r'acres[^\d]*(\d+(?:,\d+)*)',
-                    r'territory[^\d]*(\d+(?:,\d+)*)',
-                    r'(\d+)\s*acres',
-                    r'(\d+)\s*land',
-                    r'land:\s*(\d+)',
-                    r'territory:\s*(\d+)'
-                ]
-            }
-
-            available_resources = {}
-
-            for resource_type, patterns in resource_patterns.items():
-                for pattern in patterns:
-                    matches = re.findall(pattern, page_content, re.IGNORECASE)
-                    if matches:
-                        # If it's a cost/available pattern (2 numbers), take the second (available)
-                        for match in matches:
-                            try:
-                                if isinstance(match, tuple) and len(match) == 2:
-                                    # Pattern like "2,800 / 600" - take available amount (second number)
-                                    value = int(match[1].replace(',', ''))
-                                else:
-                                    # Single number pattern
-                                    value = int(str(match).replace(',', ''))
-
-                                if 0 <= value <= 1000000:  # Reasonable range
-                                    available_resources[resource_type] = value
-                                    log.info(f"💰 EXTRACTED {resource_type}: {value}")
-                                    break
-                            except:
-                                continue
-                        if resource_type in available_resources:
-                            break
-
-            # FALLBACK: Set minimum safe defaults if no resources found
-            fallback_resources = {
-                'gold': 100,    # Very conservative
-                'wood': 50,     # Very conservative
-                'stone': 50,    # Very conservative
-                'food': 50,     # Very conservative
-                'land': 1       # Very conservative land estimate
-            }
-
-            for resource, fallback_value in fallback_resources.items():
-                if resource not in available_resources:
-                    available_resources[resource] = fallback_value
-                    log.warning(f"⚠️ No {resource} found, using fallback: {fallback_value}")
-
-            log.info(f"�� CURRENT RESOURCES: {available_resources}")
-            return available_resources
-
-        except Exception as e:
-            log.warning(f"⚠️ Failed to extract resources: {e}")
-            return {'gold': 100, 'wood': 50, 'stone': 50, 'food': 50, 'land': 1}
-
-    async def _calculate_smart_training_quantity(self, action):
-        """Calculate resource-aware training quantities"""
-        try:
-            # Get latest game state if available
-            if hasattr(self, 'latest_game_state') and self.latest_game_state:
-                resources = self.latest_game_state.get("resources", {})
-                troops = self.latest_game_state.get("military", {}).get("troops", {})
-
-                available_gold = resources.get("gold", 1000)
-                total_troops = sum(troops.values()) if troops else 0
-
-                log.info(f"💰 Available gold: {available_gold}, Current troops: {total_troops}")
-
-                # Early game: train more conservatively
-                if total_troops < 100:
-                    # Use 30% of gold for training when we have few troops
-                    max_gold_for_training = int(available_gold * 0.3)
-                    quantity = max(10, min(100, max_gold_for_training // 50))  # Assume 50 gold per troop
-                elif total_troops < 500:
-                    # Mid game: more aggressive
-                    max_gold_for_training = int(available_gold * 0.5)
-                    quantity = max(20, min(300, max_gold_for_training // 50))
-                else:
-                    # Late game: very aggressive
-                    max_gold_for_training = int(available_gold * 0.7)
-                    quantity = max(50, min(1000, max_gold_for_training // 50))
-
-                log.info(f"🎯 Smart training: {quantity} troops (based on {available_gold} gold, {total_troops} current troops)")
-                return quantity
-            else:
-                # Fallback if no game state available
-                return random.randint(10, 100)
-
-        except Exception as e:
-            log.warning(f"⚠️ Smart training calculation failed: {e}")
-            return random.randint(10, 50)
-
-    async def _calculate_smart_building_quantity(self, action):
-        """Calculate resource-aware building quantities"""
-        try:
-            # Get latest game state if available
-            if hasattr(self, 'latest_game_state') and self.latest_game_state:
-                resources = self.latest_game_state.get("resources", {})
-
-                available_gold = resources.get("gold", 1000)
-                available_land = resources.get("land", 50)  # From cost displays
-
-                log.info(f"🏗️ Available: {available_gold} gold, {available_land} land")
-
-                # CRITICAL: Don't build more than we can afford in land
-                # Each building typically costs 1 land
-                max_by_land = available_land
-
-                # Don't use all gold for buildings - save some for troops
-                max_gold_for_buildings = int(available_gold * 0.4)
-                max_by_gold = max_gold_for_buildings // 150  # Assume 150 gold per building average
-
-                # Take the smaller limit (land or gold constraint)
-                quantity = min(max_by_land, max_by_gold)
-
-                # Minimum 1, maximum based on actual resources
-                quantity = max(1, min(quantity, 50))  # Cap at 50 to avoid huge numbers
-
-                log.info(f"🏗️ Smart building: {quantity} buildings (limited by {available_land} land, {available_gold} gold)")
-                return quantity
-            else:
-                # Fallback if no game state available
-                return random.randint(1, 20)
-
-        except Exception as e:
-            log.warning(f"⚠️ Smart building calculation failed: {e}")
-            return random.randint(1, 10)
-
-    async def _calculate_smart_exploration_quantity(self, action):
-        """Calculate strategic exploration troop quantities"""
-        try:
-            # Get latest game state if available
-            if hasattr(self, 'latest_game_state') and self.latest_game_state:
-                troops = self.latest_game_state.get("military", {}).get("troops", {})
-                total_troops = sum(troops.values()) if troops else 0
-
-                log.info(f"🗡️ Available troops for exploration: {total_troops}")
-
-                if total_troops < 50:
-                    # Very few troops - send small exploration parties
-                    quantity = max(1, total_troops // 4)  # Send 25% of troops
-                elif total_troops < 200:
-                    # Some troops - moderate exploration
-                    quantity = max(10, total_troops // 3)  # Send 33% of troops
-                else:
-                    # Lots of troops - aggressive exploration
-                    quantity = max(20, total_troops // 2)  # Send 50% of troops
-
-                # Cap at reasonable exploration limits
-                quantity = min(quantity, 200)
-
-                log.info(f"🗺️ Smart exploration: {quantity} troops (from {total_troops} available)")
-                return quantity
-            else:
-                # Fallback if no game state available
-                return random.randint(10, 50)
-
-        except Exception as e:
-            log.warning(f"⚠️ Smart exploration calculation failed: {e}")
-            return random.randint(5, 30)
-
-    async def _get_valid_attack_target(self):
-        """Get a valid kingdom ID for attacking - BE VERY CAREFUL"""
-        try:
-            # Get latest game state if available
-            if hasattr(self, 'latest_game_state') and self.latest_game_state:
-                troops = self.latest_game_state.get("military", {}).get("troops", {})
-                total_troops = sum(troops.values()) if troops else 0
-
-                # CRITICAL: Only attack if we have substantial troops
-                if total_troops < 500:
-                    log.warning(f"⚠️ Not enough troops for attack ({total_troops}). Need 500+. Avoiding attack.")
-                    return "000"  # Invalid kingdom to avoid actual attack
-
-                # For now, use nearby kingdom IDs (real players are usually 6000-7000 range)
-                # But be conservative - only target kingdoms close to our ID
-                nearby_targets = [
-                    6046, 6047, 6048, 6049, 6050,  # Close to our kingdom ID 6045
-                    6041, 6042, 6043, 6044,        # Also close
-                    6051, 6052, 6053               # Slightly further
-                ]
-
-                target = random.choice(nearby_targets)
-                log.info(f"🎯 Selected attack target: {target} (we have {total_troops} troops)")
-                return str(target)
-            else:
-                # Fallback - avoid attacking by using invalid ID
-                log.warning("⚠️ No game state available. Avoiding attack.")
-                return "000"
-
-        except Exception as e:
-            log.warning(f"⚠️ Target selection failed: {e}")
-            return "000"  # Invalid kingdom to avoid attack
-
-    async def _calculate_smart_exploration_distance(self):
-        """Calculate strategic exploration distances"""
-        try:
-            # Get latest game state if available
-            if hasattr(self, 'latest_game_state') and self.latest_game_state:
-                resources = self.latest_game_state.get("resources", {})
-                current_land = resources.get("land", 50)
-
-                # Early game: explore close (safer)
-                if current_land < 200:
-                    distance = random.randint(5, 15)
-                # Mid game: explore further
-                elif current_land < 500:
-                    distance = random.randint(10, 30)
-                # Late game: explore far (more land available)
-                else:
-                    distance = random.randint(20, 50)
-
-                log.info(f"🗺️ Smart exploration distance: {distance} (based on {current_land} current land)")
-                return distance
-            else:
-                # Fallback if no game state available
-                return random.randint(10, 25)
-
-        except Exception as e:
-            log.warning(f"⚠️ Distance calculation failed: {e}")
-            return random.randint(10, 20)
-
-    async def _extract_overview_data(self, page_text, game_state):
-        """Extract key data from overview page"""
-        try:
-            # Extract basic resources from overview
-            gold_match = re.search(r'gold.*?(\d+)', page_text, re.IGNORECASE)
-            if gold_match:
-                game_state["resources"]["gold"] = int(gold_match.group(1))
-
-            food_match = re.search(r'food.*?(\d+)', page_text, re.IGNORECASE)
-            if food_match:
-                game_state["resources"]["food"] = int(food_match.group(1))
-
-            # Extract territory/land info
-            land_patterns = [
-                r'(\d+)\s*acres',
-                r'territory[^\d]*(\d+)',
-                r'land[^\d]*(\d+)',
-                r'(\d+)\s*/\s*\d+.*land'  # Pattern like "192 / 500 land"
-            ]
-
-            for pattern in land_patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match and 1 <= int(match.group(1)) <= 25000:
-                    game_state["resources"]["land"] = int(match.group(1))
-                    log.info(f"📊 Extracted land: {game_state['resources']['land']} acres")
-                    break
-
-        except Exception as e:
-            log.debug(f"Failed to extract overview data: {e}")
-
-    async def _extract_military_data(self, page_text, game_state):
-        """Extract military information - TROOPS, RESOURCES"""
-        try:
-            # Extract troop counts - look for patterns like "20 footmen", "3 archers"
-            troop_types = [
-                ('archers', r'(\d+)\s+archers?'),
-                ('footmen', r'(\d+)\s+footmen'),
-                ('foot', r'(\d+)\s+foot\b'),
-                ('peasants', r'(\d+)\s+peasants?'),
-                ('pikemen', r'(\d+)\s+pikemen'),
-                ('cavalry', r'(\d+)\s+cavalry'),
-                ('knights', r'(\d+)\s+knights?'),
-                ('crossbowmen', r'(\d+)\s+crossbowmen'),
-                ('elites', r'(\d+)\s+elites?'),
-                ('heavy_cavalry', r'(\d+)\s+heavy\s+cavalry')
-            ]
-
-            total_troops = 0
-            game_state["military"]["troops"] = {}
-
-            for troop_name, pattern in troop_types:
-                matches = re.findall(pattern, page_text, re.IGNORECASE)
-                if matches:
-                    # Take the largest number found (most likely the current troop count)
-                    troop_count = max([int(match) for match in matches])
-                    if troop_count > 0:
-                        game_state["military"]["troops"][troop_name] = troop_count
-                        total_troops += troop_count
-                        log.info(f"🗡️ Found {troop_count} {troop_name}")
-
-            game_state["military"]["total_troops"] = total_troops
-            log.info(f"🗡️ Total military force: {total_troops} troops")
-
-            # Extract resources from warroom if visible (cost displays)
-            resource_patterns = [
-                (r'(\d+)\s*/\s*(\d+).*?wood', 'wood'),
-                (r'(\d+)\s*/\s*(\d+).*?stone', 'stone'),
-                (r'(\d+)\s*/\s*(\d+).*?gold', 'gold'),
-                (r'(\d+)\s*/\s*(\d+).*?land', 'land'),
-                (r'(\d+)\s*/\s*(\d+).*?food', 'food')
-            ]
-
-            for pattern, resource_name in resource_patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match:
-                    available = int(match.group(2))  # Second number is what we have
-                    game_state["resources"][resource_name] = available
-                    log.info(f"💰 Available {resource_name}: {available}")
-
-        except Exception as e:
-            log.debug(f"Failed to extract military data: {e}")
-
-    async def _extract_building_data(self, page_text, game_state):
-        """Extract building information - RESOURCES, COSTS"""
-        try:
-            # Extract current building counts
-            building_types = [
-                ('houses', r'(\d+).*?houses?'),
-                ('farms', r'(\d+).*?farms?'),
-                ('barracks', r'(\d+).*?barracks?'),
-                ('markets', r'(\d+).*?markets?'),
-                ('castles', r'(\d+).*?castles?'),
-                ('temples', r'(\d+).*?temples?'),
-                ('stables', r'(\d+).*?stables?'),
-                ('barns', r'(\d+).*?barns?'),
-                ('archery_ranges', r'(\d+).*?archery.*ranges?')
-            ]
-
-            game_state["buildings"]["current"] = {}
-
-            for building_name, pattern in building_types:
-                matches = re.findall(pattern, page_text, re.IGNORECASE)
-                if matches:
-                    building_count = max([int(match) for match in matches if int(match) < 10000])  # Avoid cost numbers
-                    if building_count > 0:
-                        game_state["buildings"]["current"][building_name] = building_count
-                        log.info(f"🏠 Current {building_name}: {building_count}")
-
-            # Extract CRITICAL resource info from building cost displays
-            # Look for patterns like "2,800 / 192" (needed/available)
-            resource_cost_patterns = [
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?land', 'land'),
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?wood', 'wood'),
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?stone', 'stone'),
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?gold', 'gold'),
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?food', 'food')
-            ]
-
-            for pattern, resource_name in resource_cost_patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match:
-                    needed_str = match.group(1).replace(',', '')
-                    available_str = match.group(2).replace(',', '')
-                    available = int(available_str)
-                    game_state["resources"][resource_name] = available
-                    log.info(f"💰 CRITICAL: Available {resource_name}: {available} (from cost display)")
-
-        except Exception as e:
-            log.debug(f"Failed to extract building data: {e}")
-
-    async def _extract_research_data(self, page_text, game_state):
-        """Extract research information"""
-        try:
-            # Look for research in progress, available tech
-            research_patterns = [
-                r'research.*?(\d+).*?progress',
-                r'technology.*?(\d+)',
-                r'science.*?(\d+)'
-            ]
-
-            for pattern in research_patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match:
-                    game_state["research"] = {"progress": int(match.group(1))}
-                    break
-
-        except Exception as e:
-            log.debug(f"Failed to extract research data: {e}")
-
 async def concurrent_action(
     action_func: Callable,
     total_quantity: int,
@@ -3921,6 +2506,9 @@ async def main():
                 if args.command == "auto":
                     # Full AI automation mode
                     if ai_system is not None:
+                        # 1. Sync state with the server before making a decision
+                        await update_ai_state(api_client, ai_system)
+
                         log.info("🤖 AI taking intelligent action...")
                         result = await ai_system.execute_intelligent_action(api_client)
                         
