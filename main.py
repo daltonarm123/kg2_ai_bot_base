@@ -250,6 +250,30 @@ class AlreadyUsedError(ApiError):
 class SessionError(ApiError):
     pass
 
+
+# ---------- Health Check Server ----------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # Silence the default logging
+        return
+
+def run_health_check_server():
+    """Run a simple HTTP server for health checks."""
+    try:
+        server_address = ('', 8080)
+        httpd = HTTPServer(server_address, HealthCheckHandler)
+        log.info("Health check server running on port 8080")
+        httpd.serve_forever()
+    except Exception as e:
+        log.error(f"Health check server failed: {e}")
+
+
 # ---------- HTTP Client ----------
 @dataclass
 class ApiClient:
@@ -574,8 +598,8 @@ class ApiClient:
                 # Find a clickable element that opens the troop selection
                 # This could be a button with text "Select Troop" or the current troop type
                 possible_triggers = await page.query_selector_all(
-                    'button:has-text("Select")'
-                    'button:has-text("Troop")'
+                    'button:has-text("Select"),'
+                    'button:has-text("Troop"),'
                     f'button:has-text("{troop_type}")'
                 )
                 if not possible_triggers:
@@ -633,178 +657,6 @@ class ApiClient:
         else:
             log.warning("⚠️ Could not find submit button.")
     
-    async def _browser_explore(self, page, params):
-        """Explore using browser clicks"""
-        try:
-            # Look for explore section
-            explore_selectors = [
-                'a[href*="explore"]',
-                'button:has-text("Explore")',
-                '.explore-tab',
-                '.explore-button'
-            ]
-            
-            for selector in explore_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(1000)
-                        log.info(f"✅ Clicked explore section: {selector}")
-                        break
-                except:
-                    continue
-
-            # Set direction and distance
-            direction = params.get('direction', 'north')
-            distance = params.get('distance', 10)
-
-            # Select direction
-            direction_selectors = [
-                f'button:has-text("{direction.title()}")',
-                f'select option:has-text("{direction.title()}")',
-                f'.direction-{direction}',
-                f'input[value="{direction}"]'
-            ]
-
-            for selector in direction_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        log.info(f"✅ Selected direction {direction}: {selector}")
-                        break
-                except:
-                    continue
-
-            # Enter distance/troops
-            distance_selectors = [
-                'input[type="number"]',
-                'input[name*="distance"]',
-                'input[name*="troops"]',
-                '.distance-input'
-            ]
-
-            for selector in distance_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.fill(str(distance))
-                        log.info(f"✅ Set distance/troops {distance}: {selector}")
-                        break
-                except:
-                    continue
-
-            # Click explore button
-            submit_selectors = [
-                'button:has-text("Explore")',
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '.explore-submit'
-            ]
-
-            for selector in submit_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(2000)
-                        log.info(f"✅ Clicked explore button: {selector}")
-                        return True
-                except:
-                    continue
-                    
-            return False
-            
-        except Exception as e:
-            log.error(f"❌ Browser explore failed: {e}")
-            return False
-    
-    async def _browser_build(self, page, params):
-        """Build using browser clicks"""
-        try:
-            # Look for build section
-            build_selectors = [
-                'a[href*="build"]',
-                'button:has-text("Build")',
-                'button:has-text("Construction")',
-                '.build-tab',
-                '.construction-tab'
-            ]
-            
-            for selector in build_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(1000)
-                        log.info(f"✅ Clicked build section: {selector}")
-                        break
-                except:
-                    continue
-
-            # Select building type
-            building_type = params.get('building_type', 'Houses')
-            building_selectors = [
-                f'button:has-text("{building_type}")',
-                f'select option:has-text("{building_type}")',
-                f'.building-{building_type.lower().replace(" ", "-")}',
-                f'input[value="{building_type}"]'
-            ]
-
-            for selector in building_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        log.info(f"✅ Selected building {building_type}: {selector}")
-                        break
-                except:
-                    continue
-
-            # Enter quantity
-            quantity = params.get('quantity', 1)
-            quantity_selectors = [
-                'input[type="number"]',
-                'input[name*="quantity"]',
-                'input[name*="amount"]',
-                '.quantity-input'
-            ]
-
-            for selector in quantity_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.fill(str(quantity))
-                        log.info(f"✅ Set quantity {quantity}: {selector}")
-                        break
-                except:
-                    continue
-
-            # Click build button
-            submit_selectors = [
-                'button:has-text("Build")',
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '.build-submit'
-            ]
-
-            for selector in submit_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(2000)
-                        log.info(f"✅ Clicked build button: {selector}")
-                        return True
-                except:
-                    continue
-                    
-            return False
-            
-        except Exception as e:
-            log.error(f"❌ Browser build failed: {e}")
-            return False
     
     async def _browser_login_process(self, page):
         """Handle login process in browser"""
@@ -3261,6 +3113,29 @@ class AdvancedAI:
 
         return quantity
 
+    def get_optimal_building_type(self) -> str:
+        """Choose a building to construct based on a simple priority list."""
+        # Priority: Houses for population, Farms for food, then economic, then military
+
+        # Check if we need more population capacity
+        # This is a simplified check; a real implementation would need to know current population vs max.
+        if "Houses" in BUILDING_TYPES and random.random() < 0.4:
+             return "Houses"
+
+        # Check if we need more food production
+        if "Grain Farms" in BUILDING_TYPES and random.random() < 0.3:
+            return "Grain Farms"
+
+        # Prioritize economic buildings
+        economic_buildings = ["Markets", "Lumber Yards", "Stone Quarries", "Barns"]
+        # Filter for buildings that are actually in the game
+        available_economic = [b for b in economic_buildings if b in BUILDING_TYPES]
+        if available_economic and random.random() < 0.2:
+            return random.choice(available_economic)
+
+        # Fallback to any random building
+        return random.choice(list(BUILDING_TYPES.keys()))
+
     def decide_next_action(self) -> Dict[str, Any]:
         """Decide what action to take next using AI logic - EXPLORATION FIRST STRATEGY"""
         self.state.action_count += 1
@@ -3635,6 +3510,10 @@ Examples:
 
 async def main():
     """Main application entry point"""
+    # Start health check server in a background thread
+    health_thread = threading.Thread(target=run_health_check_server, daemon=True)
+    health_thread.start()
+
     # Check for START_CMD in environment
     start_cmd = env("START_CMD", "auto")  # Default to AI mode
     if start_cmd and len(sys.argv) == 1:
