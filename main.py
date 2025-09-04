@@ -527,212 +527,111 @@ class ApiClient:
             log.error(f"❌ Browser action {action_type} failed: {e}")
             return False
     
-    async def _browser_train_troops(self, page, params):
-        """Train troops using intelligent screen analysis"""
+    async def _browser_train_troops(self, page, params: dict):
+        """
+        Train troops using a robust, multi-strategy browser automation approach.
+        Handles standard <select> dropdowns and custom <div>-based dropdowns.
+        """
         try:
-            log.info(f"🎮 Intelligent browser training started...")
-            
-            # Wait for page to load and take screenshot for analysis
-            await page.wait_for_timeout(5000)
-            await page.screenshot(path="warroom_analysis.png")
-            log.info(f"📸 Warroom screenshot saved for analysis")
-            
-            # Get page content for analysis
-            page_text = await page.content()
-            log.info(f"🔍 Page title: {await page.title()}")
-            log.info(f"🔍 Page URL: {page.url}")
-            
-            # CHECK FOR LOGIN PAGE
-            if "/login" in page.url:
-                log.error("❌ Still on login page - login process failed earlier")
-                return False
-            
-            # Intelligent analysis: Look for training-related elements
-            log.info("🧠 Analyzing screen for training options...")
-            
-            # First, find all clickable elements and analyze them
-            all_clickable = await page.query_selector_all('button, a, [onclick], input[type="submit"], [class*="click"]')
-            log.info(f"🔍 Found {len(all_clickable)} clickable elements on page")
-            
-            # Analyze each clickable element for training-related text
-            train_candidates = []
-            for i, element in enumerate(all_clickable):
-                try:
-                    text = await element.inner_text()
-                    if text and any(keyword in text.lower() for keyword in ['train', 'troops', 'military', 'recruit']):
-                        train_candidates.append((element, text.strip()))
-                        log.info(f"🎯 Found training candidate {i}: '{text.strip()}'")
-                except:
-                    pass
-            
-            if not train_candidates:
-                log.warning("⚠️ No obvious training buttons found, looking for plus signs or action buttons...")
-                # Look for "+ TRAIN" style buttons or action buttons
-                for i, element in enumerate(all_clickable):
-                    try:
-                        text = await element.inner_text()
-                        if text and (text.startswith('+') or 'action' in text.lower()):
-                            train_candidates.append((element, text.strip()))
-                            log.info(f"🎯 Found action candidate {i}: '{text.strip()}'")
-                    except:
-                        pass
-            
-            # Try to click the most promising training candidate
-            if not train_candidates:
-                log.error("❌ No training options found - taking debug screenshot")
-                await page.screenshot(path="debug_no_training_found.png")
-                return False
-            
-            # Click the most promising training option
-            best_candidate = train_candidates[0]  # Take the first/best match
-            element, text = best_candidate
-            
-            log.info(f"🎯 Clicking best training candidate: '{text}'")
-            await element.click()
-            await page.wait_for_timeout(3000)  # Wait for dropdown/menu to appear
-            
-            # After clicking, take another screenshot to see what opened
-            await page.screenshot(path="after_train_click.png")
-            log.info(f"📸 Screenshot after clicking training option")
-            
-            # Now look for troop type options (Foot, Archer, Cavalry, etc.)
-            log.info("🧠 Looking for troop type options...")
-            
-            troop_type = params.get('pop_type', 'foot')
+            troop_type = params.get('troop_type', 'foot')
             quantity = params.get('quantity', 1)
-            log.info(f"🎯 Trying to train {quantity} {troop_type} troops")
+            pop_type_id = params.get('pop_type_id')
 
-            # --- ROBUST DROPDOWN SELECTION LOGIC ---
-            selection_success = False
-            
-            # Strategy 1: Handle standard <select> dropdowns first (most reliable)
+            log.info(f"🎮 Browser training started for {quantity} {troop_type}(s).")
+            await page.wait_for_timeout(3000) # Wait for page to settle
+
+            # --- Strategy 1: Standard <select> dropdown ---
+            log.info("🧠 Trying strategy 1: Standard <select> dropdown...")
             try:
-                select_elements = await page.query_selector_all('select[name*="troop"], select[name*="unit"], select[id*="troop"]')
+                # Find all select elements and check their options
+                select_elements = await page.query_selector_all('select')
                 for select_element in select_elements:
-                    # Find option by text or value
-                    option_to_select = await select_element.query_selector(f'option:has-text("{troop_type}")')
-                    if option_to_select:
-                        option_value = await option_to_select.get_attribute('value')
-                        await select_element.select_option(value=option_value)
-                        log.info(f"✅ Selected '{troop_type}' from <select> dropdown.")
-                        selection_success = True
-                        break
-                if selection_success:
-                    await page.wait_for_timeout(1000)
-            except Exception as e:
-                log.warning(f"⚠️ Failed to select from <select> dropdown: {e}")
+                    # Try selecting by value (pop_type_id) first
+                    if pop_type_id:
+                        try:
+                            await select_element.select_option(value=str(pop_type_id), timeout=1000)
+                            log.info(f"✅ Selected troop by value '{pop_type_id}' in a <select> element.")
+                            # Now fill quantity and submit
+                            await self._fill_and_submit_training(page, quantity)
+                            return True
+                        except Exception:
+                            pass # Value not found, try by label
 
-            # Strategy 2: Handle custom dropdowns (buttons, links, etc.) if <select> fails
-            if not selection_success:
-                log.info("🕵️ No <select> dropdown found or selection failed. Trying custom dropdown strategy...")
-                clickable_elements = await page.query_selector_all(f'button:has-text("{troop_type}"), a:has-text("{troop_type}"), [onclick*="{troop_type}"], [class*="troop-option"]:has-text("{troop_type}")')
-
-                if clickable_elements:
-                    # Filter for the most likely candidate (visible and enabled)
-                    best_candidate = None
-                    for el in clickable_elements:
-                        if await el.is_visible() and await el.is_enabled():
-                            best_candidate = el
-                            break
-
-                    if best_candidate:
-                        log.info(f"🎯 Clicking best custom dropdown candidate for '{troop_type}'")
-                        await best_candidate.click()
-                        await page.wait_for_timeout(2000)
-                        selection_success = True
-                    else:
-                        log.warning(f"⚠️ Found candidates for '{troop_type}', but none were visible/enabled.")
-                else:
-                    log.error(f"❌ Could not find any selectable element for troop type '{troop_type}'.")
-            
-            # Look for quantity input field
-            quantity_inputs = await page.query_selector_all('input[type="number"], input[name*="quantity"], input[name*="amount"]')
-            if quantity_inputs:
-                quantity_input = quantity_inputs[0]
-                log.info(f"🎯 Found quantity input, setting to {quantity}")
-                await quantity_input.fill(str(quantity))
-                await page.wait_for_timeout(1000)
-            
-            # Look for final submit/train button
-            submit_buttons = await page.query_selector_all('button[type="submit"], input[type="submit"], button:has-text("Train"), button:has-text("Submit")')
-            if submit_buttons:
-                submit_button = submit_buttons[0]
-                submit_text = await submit_button.inner_text()
-                log.info(f"🎯 Clicking submit button: '{submit_text}'")
-                await submit_button.click()
-                await page.wait_for_timeout(2000)
-                
-                log.info(f"✅ INTELLIGENT BROWSER TRAINING SUCCESS: {quantity} {troop_type}")
-                return True
-            else:
-                log.warning("⚠️ No submit button found after setting up training")
-                return False
-            
-            # Look for troop type (foot soldiers)
-            troop_selectors = [
-                'button:has-text("Foot")',
-                'button:has-text("Infantry")', 
-                '.troop-foot',
-                'input[name*="foot"]',
-                'select option:has-text("Foot")'
-            ]
-            
-            for selector in troop_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(500)
-                        log.info(f"✅ Selected foot troops: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Enter quantity
-            quantity = params.get('quantity', 10)
-            quantity_selectors = [
-                'input[type="number"]',
-                'input[name*="quantity"]',
-                'input[name*="amount"]',
-                '.quantity-input'
-            ]
-            
-            for selector in quantity_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.fill(str(quantity))
-                        await page.wait_for_timeout(500)
-                        log.info(f"✅ Entered quantity {quantity}: {selector}")
-                        break
-                except:
-                    continue
-            
-            # Click train button
-            submit_selectors = [
-                'button:has-text("Train")',
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '.train-submit',
-                '.submit-button'
-            ]
-            
-            for selector in submit_selectors:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=2000)
-                    if element:
-                        await element.click()
-                        await page.wait_for_timeout(2000)
-                        log.info(f"✅ Clicked train button: {selector}")
+                    # Try selecting by label (troop_type)
+                    try:
+                        await select_element.select_option(label=re.compile(troop_type, re.IGNORECASE), timeout=1000)
+                        log.info(f"✅ Selected troop by label '{troop_type}' in a <select> element.")
+                        await self._fill_and_submit_training(page, quantity)
                         return True
-                except:
-                    continue
-                    
+                    except Exception:
+                        continue # Option not in this select, try next
+            except Exception as e:
+                log.warning(f"⚠️ Strategy 1 failed: {e}")
+
+            # --- Strategy 2: Custom clickable elements (div, button, a) ---
+            log.info("🧠 Trying strategy 2: Custom clickable elements...")
+            try:
+                # Find a clickable element that opens the troop selection
+                # This could be a button with text "Select Troop" or the current troop type
+                possible_triggers = await page.query_selector_all(
+                    'button:has-text("Select")'
+                    'button:has-text("Troop")'
+                    f'button:has-text("{troop_type}")'
+                )
+                if not possible_triggers:
+                    # A more generic search for any clickable element
+                    possible_triggers = await page.query_selector_all('div[role="button"], button')
+
+                for trigger in possible_triggers:
+                    try:
+                        await trigger.click(timeout=1000)
+                        await page.wait_for_timeout(1000) # wait for dropdown to open
+                        log.info("🖱️ Clicked a potential dropdown trigger.")
+
+                        # Now find the troop option in the opened dropdown
+                        # Options might be buttons, divs, or list items
+                        troop_option_selector = f'text=/{troop_type}/i'
+                        troop_option = await page.wait_for_selector(troop_option_selector, timeout=2000)
+
+                        if troop_option:
+                            log.info(f"✅ Found custom dropdown option for '{troop_type}'.")
+                            await troop_option.click()
+                            await self._fill_and_submit_training(page, quantity)
+                            return True
+                    except Exception:
+                        continue # This trigger didn't work, try the next
+            except Exception as e:
+                log.warning(f"⚠️ Strategy 2 failed: {e}")
+
+            log.error(f"❌ All strategies to select troop '{troop_type}' failed.")
+            await page.screenshot(path=f"debug_train_troops_failed_{troop_type}.png")
             return False
-            
+
         except Exception as e:
             log.error(f"❌ Browser train failed: {e}")
+            await page.screenshot(path="debug_train_troops_exception.png")
             return False
+
+    async def _fill_and_submit_training(self, page, quantity: int):
+        """Helper to fill quantity and submit the training form."""
+        log.info(f"📝 Filling quantity '{quantity}' and submitting.")
+
+        # Fill quantity
+        quantity_input = await page.query_selector('input[name*="quantity"], input[type="number"]')
+        if quantity_input:
+            await quantity_input.fill(str(quantity))
+            log.info("✅ Filled quantity.")
+        else:
+            log.warning("⚠️ Could not find quantity input field.")
+
+        # Click submit
+        submit_button = await page.query_selector('button[type="submit"], input[type="submit"], button:has-text("Train")')
+        if submit_button:
+            await submit_button.click()
+            log.info("✅ Clicked train/submit button.")
+            await page.wait_for_timeout(3000) # Wait for action to complete
+        else:
+            log.warning("⚠️ Could not find submit button.")
     
     async def _browser_explore(self, page, params):
         """Explore using browser clicks"""
@@ -1840,23 +1739,6 @@ class ApiClient:
             log.warning(f"⚠️ Failed to handle select field {field_name}: {e}")
         return False
 
-
-     async def _handle_select_field(self, select_field, field_name, action):
-        """Handle dropdown/select fields"""
-        try:
-            options = await select_field.query_selector_all('option')
-            if len(options) <= 1:
-                return False
-
-            # ... other logic ...
-
-        except Exception as e:
-            log.warning(f"⚠️ Failed to handle select field {field_name}: {e}")
-        return False   # stays indented inside the function
-
-
-
-
     async def _handle_number_field(self, input_field, field_name, action, input_name, input_id):
         """Handle number and text input fields - ULTRA-CONSERVATIVE RESOURCE AWARE"""
         try:
@@ -2423,7 +2305,7 @@ class ApiClient:
                 (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?wood', 'wood'),
                 (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?stone', 'stone'),
                 (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?gold', 'gold'),
-                (r'(\d+(?:,\d+)*)\s*/\s*(\d+(?:,\d+)*).*?food', 'food')
+                (r'(\d+(?:,\d+)*)\s*/\s*(\d+).*?food', 'food')
             ]
 
             for pattern, resource_name in resource_cost_patterns:
@@ -3303,255 +3185,81 @@ class AdvancedAI:
             # Balanced force - pick based on strategic need
             return random.choice(['foot', 'archer', 'cavalry', 'siege'])
 
-        def calculate_training_quantity(self, troop_type: str) -> int:
-        """Calculate how many troops to train - ULTRA CONSERVATIVE FOR EARLY GAME"""
-        base_cost = {
-            'foot': 50,
-            'archer': 75,
-            'cavalry': 150,
-            'siege': 300
-        }
-
-        # CRITICAL: Check if we had recent resource failures
-        if 'train' in self.state.recent_failures:
-            log.warning("🚨 Recent training failures - using MINIMAL quantities")
-            return 1  # Only train 1 at a time if we've had failures
-
-        # Use realistic resource estimates based on game phase
-        available_gold = self.state.estimated_resources.get('gold', 100)  # Changed from 1000 to 100
-        unit_cost = base_cost.get(troop_type, 50)
-
-        # EARLY GAME: Ultra conservative
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:
-            # Use only 5% of gold for training in early game
-            max_affordable = max(1, (available_gold * 0.05) // unit_cost)
-            quantity = max(1, min(1, max_affordable))  # NEVER more than 1 in early game
-            log.info(f"�� ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
-
-        # MID GAME: Still conservative
-        elif self.state.game_phase == 'mid':
-            max_affordable = max(1, (available_gold * 0.15) // unit_cost)  # 15% of gold
-            quantity = max(1, min(2, max_affordable))  # Changed from 10 to 2
-            log.info(f"��️ MID GAME TRAINING: {quantity} {troop_type} troops")
-
-        # LATE GAME: More aggressive
-        else:
-            max_affordable = max(1, (available_gold * 0.25) // unit_cost)  # 25% of gold
-            quantity = max(1, min(5, max_affordable))  # Changed from 20 to 5
-            log.info(f"⚔️ LATE GAME TRAINING: {quantity} {troop_type} troops")
-
-        return quantity
-
-
-        # CRITICAL: Check if we had recent resource failures
-        if 'train' in self.state.recent_failures:
-            log.warning("🚨 Recent training failures - using MINIMAL quantities")
-            return 1  # Only train 1 at a time if we've had failures
-
-        # Use realistic resource estimates based on game phase
-        available_gold = self.state.estimated_resources.get('gold', 1000)  # Conservative default
-        unit_cost = base_cost.get(troop_type, 50)
-
-        # EARLY GAME: Ultra conservative
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:
-            # Use only 5% of gold for training in early game
-            max_affordable = max(1, (available_gold * 0.05) // unit_cost)
-            quantity = max(1, min(1, max_affordable))  # NEVER more than 1 in early game
-            log.info(f"🌱 ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
-
-        # MID GAME: Still conservative
-        elif self.state.game_phase == 'mid':
-            max_affordable = max(1, (available_gold * 0.15) // unit_cost)  # 15% of gold
-            quantity = max(1, min(10, max_affordable))
-            log.info(f"🏗️ MID GAME TRAINING: {quantity} {troop_type} troops")
-
-        # LATE GAME: More aggressive
-        else:
-            max_affordable = max(1, (available_gold * 0.25) // unit_cost)  # 25% of gold
-            quantity = max(1, min(20, max_affordable))
-            log.info(f"⚔️ LATE GAME TRAINING: {quantity} {troop_type} troops")
-
-        return quantity
-
-    def calculate_exploration_troop_count(self) -> int:
-        """Calculate optimal troop count for exploration - but check if we have troops first!"""
-        total_troops = sum(self.state.troops.values())
-        available_gold = self.state.estimated_resources.get('gold', 1000)
-
-        # CRITICAL: If we have no troops, we can't explore!
-        if total_troops == 0:
-            log.warning("🚫 Cannot explore - no troops available! Need to train troops first.")
-            return 0
-
-        # Early game: Send significant portion for max land gain
-        if self.state.territory_size < 500:
-            # Send 25-50% of army or at least 5-10 troops
-            exploration_force = max(5, int(total_troops * 0.25))
-            # But also consider affordability
-            if available_gold > 500:
-                exploration_force = max(exploration_force, 10)
-            return min(exploration_force, min(50, total_troops))  # Don't send more than we have
-
-        # Mid game: Moderate exploration force
-        elif self.state.territory_size < 5000:
-            exploration_force = max(5, int(total_troops * 0.15))
-            return min(exploration_force, min(30, total_troops))
-
-        # Late game: Minimal exploration (should be attacking instead)
-        else:
-            return max(1, min(5, int(total_troops * 0.05)))
-
-    def get_optimal_building_type(self) -> str:
-        """Choose best building type based on GAME RULES & MAINTENANCE"""
-        current_buildings = self.state.buildings
-        territory = self.state.territory_size
-
-        # Prioritize spy infrastructure if we're having spy failures
-        if self.state.spy_failures > 0 and current_buildings.get('spy_den', 0) < 3:
-            return 'spy_den'
-
-        # GAME RULES: Buildings need 1% maintenance per hour
-        # Prioritize resource production to handle maintenance
-
-        # Early game: Focus on population and basic resources
-        if territory < 500:
-            if current_buildings.get('Houses', 0) < territory // 20:  # Houses for population
-                return 'Houses'
-            elif current_buildings.get('Grain Farms', 0) < territory // 30:  # Farms for food
-                return 'Grain Farms'
-            elif current_buildings.get('Barns', 0) < territory // 50:  # Resource storage
-                return 'Barns'
-            elif current_buildings.get('Markets', 0) < territory // 50:  # Trade and economy
-                return 'Markets'
-
-        # Mid game: Balanced infrastructure
-        elif territory < 5000:
-            # Resource buildings (maintenance critical)
-            if current_buildings.get('Barns', 0) < territory // 40:
-                return 'Barns'
-            elif current_buildings.get('Markets', 0) < territory // 40:
-                return 'Markets'
-            elif current_buildings.get('Grain Farms', 0) < territory // 25:
-                return 'Grain Farms'
-            
-            # Population and military
-            elif current_buildings.get('Houses', 0) < territory // 15:
-                return 'Houses'
-            elif current_buildings.get('Barracks', 0) < territory // 100:  # Infantry training
-                return 'Barracks'
-            elif current_buildings.get('Archery Ranges', 0) < territory // 150:  # Archer training
-                return 'Archery Ranges'
-            elif current_buildings.get('Stables', 0) < territory // 200:  # Cavalry training
-                return 'Stables'
-
-        # Late game: Advanced infrastructure
-        else:
-            # Ensure massive resource production for large kingdom
-            if current_buildings.get('Barns', 0) < territory // 30:
-                return 'Barns'
-            elif current_buildings.get('Markets', 0) < territory // 30:
-                return 'Markets'
-            elif current_buildings.get('Grain Farms', 0) < territory // 20:
-                return 'Grain Farms'
-            
-            # Advanced military buildings
-            elif current_buildings.get('Castles', 0) < territory // 500:  # Knights & population
-                return 'Castles'
-            elif current_buildings.get('Embassies', 0) < territory // 1000:  # Spy infrastructure
-                return 'Embassies'
-            elif current_buildings.get('Temples', 0) < territory // 1000:  # Priests for mana
-                return 'Temples'
-
-        # Fallback to basic needs
-        return random.choice(['Houses', 'Grain Farms', 'Barns', 'Markets'])
-
     def calculate_training_quantity(self, troop_type: str) -> int:
-        """Calculate a smart quantity of troops to train based on resources and game phase."""
-        base_cost = {'foot': 50, 'archer': 70, 'cavalry': 100, 'siege': 150}
+        """Smarter calculation for troop training quantity based on resources and game phase."""
+        base_cost = {'foot': 50, 'archer': 75, 'cavalry': 150, 'siege': 300}
+        unit_cost = base_cost.get(troop_type, 50)
+
+        available_gold = self.state.estimated_resources.get('gold', 0)
 
         if 'train' in self.state.recent_failures:
-            log.warning("🚨 Recent training failures - using MINIMAL quantity of 1.")
+            log.warning("🚨 Recent training failure. Training a minimal quantity.")
             return 1
 
-        available_gold = self.state.estimated_resources.get('gold', 100)
-        unit_cost = base_cost.get(troop_type, 75)
-
-        # Determine the percentage of gold to spend based on game phase
+        # Determine the percentage of gold to use based on game phase
         if self.state.game_phase == 'early':
-            gold_percentage = 0.15
-            max_qty_cap = 10
+            gold_percent_to_use = 0.20  # Use 20% of gold in early game
         elif self.state.game_phase == 'mid':
-            gold_percentage = 0.30
-            max_qty_cap = 50
+            gold_percent_to_use = 0.40  # Use 40% in mid game
         else: # late game
-            gold_percentage = 0.50
-            max_qty_cap = 200
+            gold_percent_to_use = 0.60  # Use 60% in late game
 
-        max_affordable = int((available_gold * gold_percentage) / unit_cost) if unit_cost > 0 else float('inf')
-        quantity = max(1, min(max_affordable, max_qty_cap))
+        # Calculate how many units can be afforded with the allocated gold
+        gold_for_training = available_gold * gold_percent_to_use
+        if unit_cost > 0:
+            quantity = int(gold_for_training // unit_cost)
+        else:
+            quantity = 0 # Avoid division by zero
 
-        log.info(f"⚔️ Training calculation for {troop_type}:")
-        log.info(f"   - Resources: G:{available_gold}")
-        log.info(f"   - Max Affordable (with {gold_percentage*100}% budget): {max_affordable}")
-        log.info(f"   - Decided Quantity: {quantity} (Phase: {self.state.game_phase})")
+        # Ensure at least 1 troop is trained if affordable
+        if quantity == 0 and available_gold >= unit_cost:
+            quantity = 1
+
+        log.info(f"TRAINING CALC: Phase: {self.state.game_phase}, Gold: {available_gold}, "
+                 f"Unit: {troop_type}, Cost: {unit_cost}, "
+                 f"Qty: {quantity}")
 
         return quantity
 
     def calculate_building_quantity(self, building_type: str) -> int:
-        """Calculate optimal number of buildings to build based on REAL land and resources."""
-        base_cost = {
-            'Houses': 50, 'Grain Farms': 75, 'Barns': 100, 'Markets': 150,
-            'Barracks': 200, 'Archery Ranges': 250, 'Stables': 300,
-            'Castles': 1000, 'Embassies': 500, 'Temples': 400
-        }
+        """Calculate how many buildings to build, respecting land constraints."""
 
-        if 'build' in self.state.recent_failures:
-            log.warning("🚨 Recent building failures - using MINIMAL quantity of 1.")
-            return 1
-
-        # Use REAL game state data, not estimates
-        total_land = self.state.territory_size
-        used_land = sum(self.state.buildings.values())
-        free_land = total_land - used_land
-
-        available_gold = self.state.estimated_resources.get('gold', 100)
-        available_wood = self.state.estimated_resources.get('wood', 100)
-        available_stone = self.state.estimated_resources.get('stone', 100)
-        building_cost_gold = base_cost.get(building_type, 100)
-        building_cost_wood = 20  # Assume average cost
-        building_cost_stone = 20 # Assume average cost
+        # Correctly calculate free land
+        total_buildings = sum(self.state.buildings.values())
+        free_land = self.state.territory_size - total_buildings
 
         if free_land <= 0:
-            log.warning(f"🚫 Cannot build {building_type} - no free land. Total: {total_land}, Used: {used_land}")
+            log.warning(f"No free land to build. Buildings: {total_buildings}, Land: {self.state.territory_size}")
             return 0
 
-        # Calculate max affordable by each resource, with free_land as the primary constraint
-        max_by_land = free_land
-        max_by_gold = available_gold // building_cost_gold if building_cost_gold > 0 else float('inf')
-        max_by_wood = available_wood // building_cost_wood if building_cost_wood > 0 else float('inf')
-        max_by_stone = available_stone // building_cost_stone if building_cost_stone > 0 else float('inf')
+        base_cost = {
+            'Houses': 100, 'Grain Farms': 150, 'Barracks': 300,
+            'Archery Ranges': 250, 'Stables': 400, 'Markets': 150,
+            'Barns': 200, 'Castles': 1000, 'Temples': 600
+        }
 
-        # The actual quantity is limited by the minimum of all constraints
-        quantity = int(min(max_by_land, max_by_gold, max_by_wood, max_by_stone))
+        building_cost = base_cost.get(building_type, 100)
+        available_gold = self.state.estimated_resources.get('gold', 0)
 
-        # Adjust quantity based on game phase for strategic pacing
+        max_affordable_by_gold = (available_gold // building_cost) if building_cost > 0 else free_land
+
+        # The number of buildings to build is limited by free land and what we can afford.
+        quantity = min(free_land, max_affordable_by_gold)
+
+        # Apply game phase strategy to the potential quantity
         if self.state.game_phase == 'early':
-            quantity = min(quantity, 3)
+            quantity = min(quantity, 1)
         elif self.state.game_phase == 'mid':
-            quantity = min(quantity, 10)
+            quantity = min(quantity, max(1, int(free_land * 0.5)))
         else: # late game
-            quantity = min(quantity, 25)
+            pass # Be aggressive
 
-        # Ensure we always build at least 1 if possible, but never more than available free land
-        final_quantity = max(0, min(quantity, free_land))
+        # Final check to ensure quantity is not negative
+        quantity = max(0, quantity)
 
-        log.info(f"🛠️ Building calculation for {building_type}:")
-        log.info(f"   - Land: {free_land} free ({total_land} total - {used_land} used)")
-        log.info(f"   - Resources: G:{available_gold}, W:{available_wood}, S:{available_stone}")
-        log.info(f"   - Constraints: Land:{max_by_land}, Gold:{max_by_gold}, Wood:{max_by_wood}, Stone:{max_by_stone}")
-        log.info(f"   - Decided Quantity: {final_quantity} (Phase: {self.state.game_phase})")
+        log.info(f"Final Build Decision: {quantity} {building_type}(s). Free Land: {free_land}, Gold Affordable: {max_affordable_by_gold}")
 
-        return final_quantity
+        return quantity
 
     def decide_next_action(self) -> Dict[str, Any]:
         """Decide what action to take next using AI logic - EXPLORATION FIRST STRATEGY"""
@@ -3562,7 +3270,7 @@ class AdvancedAI:
 
         # NEW STRATEGY: Only explore until we have 600+ spare land
         if current_land < 600:
-            log.info(f"�� EXPLORATION PHASE: {current_land} land < 600 - FOCUS ON EXPLORATION ONLY")
+            log.info(f"🗺️ EXPLORATION PHASE: {current_land} land < 600 - FOCUS ON EXPLORATION ONLY")
 
             # Check if we have troops to explore
             total_troops = sum(self.state.troops.values())
@@ -3582,7 +3290,7 @@ class AdvancedAI:
                     'troop_count': 1  # Send only 1 troop for exploration
                 }
         else:
-            log.info(f"��️ BUILDING PHASE: {current_land} land >= 600 - START BUILDING")
+            log.info(f"BUILDING PHASE: {current_land} land >= 600 - START BUILDING")
 
             # Now we can start building infrastructure
             action_roll = random.random()
@@ -4055,49 +3763,5 @@ async def main():
     finally:
         await api_client.client.aclose()
 
-# Health check server for deployment
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        """Handle GET requests for health checks"""
-        if self.path == "/" or self.path == "/health":
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {
-                "status": "healthy",
-                "bot": "KG2 AI Bot",
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "uptime": time.time() - start_time if 'start_time' in globals() else 0
-            }
-            self.wfile.write(json.dumps(response).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress HTTP server logs to keep bot logs clean
-        pass
-
-def start_health_server():
-    """Start health check server in background thread"""
-    port = int(os.environ.get('PORT', 5000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    log.info(f"Health check server starting on port {port}")
-    server.serve_forever()
-
 if __name__ == "__main__":
-    global start_time
-    start_time = time.time()
-    
-    # Start health check server in background thread for deployment
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    log.info("Health check server started for deployment")
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
-    except Exception as e:
-        log.error(f"Fatal error: {e}")
-        sys.exit(1)
+    asyncio.run(main())
