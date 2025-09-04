@@ -1770,7 +1770,7 @@ class AdvancedAI:
             # Balanced force - pick based on strategic need
             return random.choice(['foot', 'archer', 'cavalry', 'siege'])
 
-        def calculate_training_quantity(self, troop_type: str) -> int:
+    def calculate_training_quantity(self, troop_type: str) -> int:
         """Calculate how many troops to train - ULTRA CONSERVATIVE FOR EARLY GAME"""
         base_cost = {
             'foot': 50,
@@ -1793,13 +1793,13 @@ class AdvancedAI:
             # Use only 5% of gold for training in early game
             max_affordable = max(1, (available_gold * 0.05) // unit_cost)
             quantity = max(1, min(1, max_affordable))  # NEVER more than 1 in early game
-            log.info(f"�� ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
+            log.info(f"🌱 ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
 
         # MID GAME: Still conservative
         elif self.state.game_phase == 'mid':
             max_affordable = max(1, (available_gold * 0.15) // unit_cost)  # 15% of gold
             quantity = max(1, min(2, max_affordable))  # Changed from 10 to 2
-            log.info(f"��️ MID GAME TRAINING: {quantity} {troop_type} troops")
+            log.info(f"🏗️ MID GAME TRAINING: {quantity} {troop_type} troops")
 
         # LATE GAME: More aggressive
         else:
@@ -1944,7 +1944,7 @@ class AdvancedAI:
             
         return int(quantity)
 
-    d    def decide_next_action(self) -> Dict[str, Any]:
+    def decide_next_action(self) -> Dict[str, Any]:
         """Decide what action to take next using AI logic - EXPLORATION FIRST STRATEGY"""
         self.state.action_count += 1
 
