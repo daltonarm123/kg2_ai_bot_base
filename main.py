@@ -625,7 +625,6 @@ class ApiClient:
             # Strategy 2: Handle custom dropdowns (buttons, links, etc.) if <select> fails
             if not selection_success:
                 log.info("🕵️ No <select> dropdown found or selection failed. Trying custom dropdown strategy...")
-                # This selector is intentionally broad to catch various custom implementations
                 clickable_elements = await page.query_selector_all(f'button:has-text("{troop_type}"), a:has-text("{troop_type}"), [onclick*="{troop_type}"], [class*="troop-option"]:has-text("{troop_type}")')
 
                 if clickable_elements:
@@ -3257,38 +3256,6 @@ class AdvancedAI:
         """Choose best troop type based on GAME RULES (RPS system)"""
         current_troops = self.state.troops
 
-    def calculate_training_quantity(self, troop_type: str) -> int:
-        """Calculate a smart quantity of troops to train based on resources and game phase."""
-        base_cost = {'foot': 50, 'archer': 70, 'cavalry': 100, 'siege': 150}
-
-        if 'train' in self.state.recent_failures:
-            log.warning("🚨 Recent training failures - using MINIMAL quantity of 1.")
-            return 1
-
-        available_gold = self.state.estimated_resources.get('gold', 100)
-        unit_cost = base_cost.get(troop_type, 75)
-
-        # Determine the percentage of gold to spend based on game phase
-        if self.state.game_phase == 'early':
-            gold_percentage = 0.15  # Use 15% of gold for troops early on
-            max_qty_cap = 10
-        elif self.state.game_phase == 'mid':
-            gold_percentage = 0.30  # Use 30% in mid-game
-            max_qty_cap = 50
-        else: # late game
-            gold_percentage = 0.50  # Use 50% in late-game for large armies
-            max_qty_cap = 200
-
-        max_affordable = int((available_gold * gold_percentage) / unit_cost)
-        quantity = max(1, min(max_affordable, max_qty_cap))
-
-        log.info(f"⚔️ Training calculation for {troop_type}:")
-        log.info(f"   - Resources: G:{available_gold}")
-        log.info(f"   - Max Affordable (with {gold_percentage*100}% budget): {max_affordable}")
-        log.info(f"   - Decided Quantity: {quantity} (Phase: {self.state.game_phase})")
-
-        return quantity
-
         # Prioritize spies if we have spy failures
         if self.state.spy_failures > 0:
             return 'foot'  # Footmen can be trained for spy missions
@@ -3336,6 +3303,44 @@ class AdvancedAI:
             # Balanced force - pick based on strategic need
             return random.choice(['foot', 'archer', 'cavalry', 'siege'])
 
+        def calculate_training_quantity(self, troop_type: str) -> int:
+        """Calculate how many troops to train - ULTRA CONSERVATIVE FOR EARLY GAME"""
+        base_cost = {
+            'foot': 50,
+            'archer': 75,
+            'cavalry': 150,
+            'siege': 300
+        }
+
+        # CRITICAL: Check if we had recent resource failures
+        if 'train' in self.state.recent_failures:
+            log.warning("🚨 Recent training failures - using MINIMAL quantities")
+            return 1  # Only train 1 at a time if we've had failures
+
+        # Use realistic resource estimates based on game phase
+        available_gold = self.state.estimated_resources.get('gold', 100)  # Changed from 1000 to 100
+        unit_cost = base_cost.get(troop_type, 50)
+
+        # EARLY GAME: Ultra conservative
+        if self.state.game_phase == 'early' or self.state.territory_size < 100:
+            # Use only 5% of gold for training in early game
+            max_affordable = max(1, (available_gold * 0.05) // unit_cost)
+            quantity = max(1, min(1, max_affordable))  # NEVER more than 1 in early game
+            log.info(f"�� ULTRA-CONSERVATIVE TRAINING: {quantity} {troop_type} troops (using {quantity * unit_cost} gold from {available_gold} available)")
+
+        # MID GAME: Still conservative
+        elif self.state.game_phase == 'mid':
+            max_affordable = max(1, (available_gold * 0.15) // unit_cost)  # 15% of gold
+            quantity = max(1, min(2, max_affordable))  # Changed from 10 to 2
+            log.info(f"��️ MID GAME TRAINING: {quantity} {troop_type} troops")
+
+        # LATE GAME: More aggressive
+        else:
+            max_affordable = max(1, (available_gold * 0.25) // unit_cost)  # 25% of gold
+            quantity = max(1, min(5, max_affordable))  # Changed from 20 to 5
+            log.info(f"⚔️ LATE GAME TRAINING: {quantity} {troop_type} troops")
+
+        return quantity
 
 
         # CRITICAL: Check if we had recent resource failures
@@ -3460,50 +3465,39 @@ class AdvancedAI:
         # Fallback to basic needs
         return random.choice(['Houses', 'Grain Farms', 'Barns', 'Markets'])
 
+    def calculate_training_quantity(self, troop_type: str) -> int:
+        """Calculate a smart quantity of troops to train based on resources and game phase."""
+        base_cost = {'foot': 50, 'archer': 70, 'cavalry': 100, 'siege': 150}
 
-        # CRITICAL: Check if we had recent resource failures
-        if 'build' in self.state.recent_failures:
-            log.warning("🚨 Recent building failures - using MINIMAL quantities")
-            return 1  # Only build 1 at a time if we've had failures
+        if 'train' in self.state.recent_failures:
+            log.warning("🚨 Recent training failures - using MINIMAL quantity of 1.")
+            return 1
 
-        # Use realistic resource estimates based on game phase
-        available_gold = self.state.estimated_resources.get('gold', 1000)  # Very conservative default
-        available_land = self.state.estimated_resources.get('land', 10)    # Very conservative land
-        available_wood = self.state.estimated_resources.get('wood', 100)   # Wood constraint
-        available_stone = self.state.estimated_resources.get('stone', 100) # Stone constraint
-        building_cost = base_cost.get(building_type, 100)
+        available_gold = self.state.estimated_resources.get('gold', 100)
+        unit_cost = base_cost.get(troop_type, 75)
 
-        # EARLY GAME: Ultra conservative (current situation with ~1 land)
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:
-            # Can only build what we have land for
-            max_by_land = max(1, available_land // 2)  # Use half available land
-            max_by_gold = max(1, (available_gold * 0.1) // building_cost)  # Use only 10% of gold
-            max_by_wood = max(1, available_wood // 20)  # Wood constraint
-            max_by_stone = max(1, available_stone // 20)  # Stone constraint
-
-            # Take the SMALLEST constraint
-            quantity = min(max_by_land, max_by_gold, max_by_wood, max_by_stone)
-            quantity = max(1, min(3, quantity))  # NEVER more than 3 in early game
-
-            log.info(f"🌱 EARLY GAME BUILDING: {quantity} {building_type} (land:{available_land}, gold:{available_gold}, wood:{available_wood}, stone:{available_stone})")
-
-        # MID GAME: Still conservative
+        # Determine the percentage of gold to spend based on game phase
+        if self.state.game_phase == 'early':
+            gold_percentage = 0.15
+            max_qty_cap = 10
         elif self.state.game_phase == 'mid':
-            max_by_land = available_land
-            max_by_gold = max(1, (available_gold * 0.2) // building_cost)  # 20% of gold
-            quantity = max(1, min(5, min(max_by_land, max_by_gold)))
-            log.info(f"🏗️ MID GAME BUILDING: {quantity} {building_type}")
+            gold_percentage = 0.30
+            max_qty_cap = 50
+        else: # late game
+            gold_percentage = 0.50
+            max_qty_cap = 200
 
-        # LATE GAME: More aggressive
-        else:
-            max_by_land = available_land
-            max_by_gold = max(1, (available_gold * 0.3) // building_cost)  # 30% of gold
-            quantity = max(1, min(10, min(max_by_land, max_by_gold)))
-            log.info(f"⚔️ LATE GAME BUILDING: {quantity} {building_type}")
+        max_affordable = int((available_gold * gold_percentage) / unit_cost) if unit_cost > 0 else float('inf')
+        quantity = max(1, min(max_affordable, max_qty_cap))
+
+        log.info(f"⚔️ Training calculation for {troop_type}:")
+        log.info(f"   - Resources: G:{available_gold}")
+        log.info(f"   - Max Affordable (with {gold_percentage*100}% budget): {max_affordable}")
+        log.info(f"   - Decided Quantity: {quantity} (Phase: {self.state.game_phase})")
 
         return quantity
 
-    def _calculate_building_quantity_fixed(self, building_type: str) -> int:
+    def calculate_building_quantity(self, building_type: str) -> int:
         """Calculate optimal number of buildings to build based on REAL land and resources."""
         base_cost = {
             'Houses': 50, 'Grain Farms': 75, 'Barns': 100, 'Markets': 150,
@@ -3511,7 +3505,6 @@ class AdvancedAI:
             'Castles': 1000, 'Embassies': 500, 'Temples': 400
         }
 
-        # CRITICAL: Check for recent resource failures
         if 'build' in self.state.recent_failures:
             log.warning("🚨 Recent building failures - using MINIMAL quantity of 1.")
             return 1
@@ -3525,14 +3518,14 @@ class AdvancedAI:
         available_wood = self.state.estimated_resources.get('wood', 100)
         available_stone = self.state.estimated_resources.get('stone', 100)
         building_cost_gold = base_cost.get(building_type, 100)
-        building_cost_wood = 20
-        building_cost_stone = 20
+        building_cost_wood = 20  # Assume average cost
+        building_cost_stone = 20 # Assume average cost
 
         if free_land <= 0:
             log.warning(f"🚫 Cannot build {building_type} - no free land. Total: {total_land}, Used: {used_land}")
             return 0
 
-        # Calculate max affordable by each resource
+        # Calculate max affordable by each resource, with free_land as the primary constraint
         max_by_land = free_land
         max_by_gold = available_gold // building_cost_gold if building_cost_gold > 0 else float('inf')
         max_by_wood = available_wood // building_cost_wood if building_cost_wood > 0 else float('inf')
@@ -3541,7 +3534,7 @@ class AdvancedAI:
         # The actual quantity is limited by the minimum of all constraints
         quantity = int(min(max_by_land, max_by_gold, max_by_wood, max_by_stone))
 
-        # Adjust for strategic pacing
+        # Adjust quantity based on game phase for strategic pacing
         if self.state.game_phase == 'early':
             quantity = min(quantity, 3)
         elif self.state.game_phase == 'mid':
@@ -3549,7 +3542,7 @@ class AdvancedAI:
         else: # late game
             quantity = min(quantity, 25)
 
-        # Ensure we always build at least 1 if possible, but never more than available free land.
+        # Ensure we always build at least 1 if possible, but never more than available free land
         final_quantity = max(0, min(quantity, free_land))
 
         log.info(f"🛠️ Building calculation for {building_type}:")
@@ -3560,153 +3553,71 @@ class AdvancedAI:
 
         return final_quantity
 
-        # 2. Check if we should spy (LOW priority in early game)
-        if self.should_spy():
-            self.state.last_spy_time = time.time()
-            spy_type = 'gather_intel'  # Default safe spy type
-            if self.state.spy_failures > 0:
-                # If we've been failing, try easier spy missions first
-                spy_type = random.choice(['infiltrate', 'gather_intel'])
-            else:
-                # If spying is working, try more aggressive missions
-                spy_type = random.choice(list(SPY_TYPES.keys()))
+    def decide_next_action(self) -> Dict[str, Any]:
+        """Decide what action to take next using AI logic - EXPLORATION FIRST STRATEGY"""
+        self.state.action_count += 1
 
-            return {
-                'action': 'spy',
-                'target': self.choose_target_kingdom(),
-                'spy_type': spy_type
-            }
+        # CRITICAL: Check current land/territory size from real-time resources
+        current_land = self.state.territory_size  # This should be updated from page scraping
 
-        # 3. If we have many spy failures, train troops to fix it
-        if self.state.spy_failures > 5:  # Higher threshold
-            troop_type = self.get_optimal_troop_type()
-            quantity = self.calculate_training_quantity(troop_type)
-            return {
-                'action': 'train',
-                'troop_type': troop_type,
-                'quantity': quantity
-            }
+        # NEW STRATEGY: Only explore until we have 600+ spare land
+        if current_land < 600:
+            log.info(f"�� EXPLORATION PHASE: {current_land} land < 600 - FOCUS ON EXPLORATION ONLY")
 
-        if self.should_explore():
-            self.state.last_explore_time = time.time()
-            return {
-                'action': 'explore',
-                'explore_type': random.choice(list(EXPLORE_TYPES.keys())),
-                'direction': random.choice(['north', 'south', 'east', 'west'])
-            }
-
-        if self.should_attack():
-            self.state.last_attack_time = time.time()
+            # Check if we have troops to explore
             total_troops = sum(self.state.troops.values())
-            attack_force = int(total_troops * random.uniform(0.3, 0.7))  # Use 30-70% of troops
-            return {
-                'action': 'attack',
-                'target': self.choose_target_kingdom(),
-                'attack_type': random.choice(list(ATTACK_TYPES.keys())),
-                'troop_count': max(1, attack_force)
-            }
+            if total_troops == 0:
+                log.info("🏗️ No troops available - training 1 troop first")
+                return {
+                    'action': 'train',
+                    'troop_type': 'foot',
+                    'quantity': 1
+                }
+            else:
+                log.info(f"🗺️ Exploring with {total_troops} available troops")
+                return {
+                    'action': 'explore',
+                    'explore_type': 'scout',
+                    'direction': random.choice(['north', 'south', 'east', 'west']),
+                    'troop_count': 1  # Send only 1 troop for exploration
+                }
+        else:
+            log.info(f"��️ BUILDING PHASE: {current_land} land >= 600 - START BUILDING")
 
-        # 4. MAIN ACTIONS: Building kingdom infrastructure
-        action_roll = random.random()
+            # Now we can start building infrastructure
+            action_roll = random.random()
 
-        # Adjust priorities based on game phase - FIXED FOR EARLY GAME
-        if self.state.game_phase == 'early' or self.state.territory_size < 100:  # TRUE EARLY GAME
-            log.info(f"🌱 EARLY GAME STRATEGY: {self.state.territory_size} land - EXPLORATION FOCUSED")
-
-            # EARLY GAME: 80% exploration, 15% troops, 5% buildings
-            if action_roll < 0.8:  # 80% chance to explore for land
-                if self.should_explore():
-                    self.state.last_explore_time = time.time()
+            if action_roll < 0.6:  # 60% chance to build
+                building_type = self.get_optimal_building_type()
+                quantity = 1  # Build only 1 at a time
+                return {
+                    'action': 'build',
+                    'building_type': building_type,
+                    'quantity': quantity
+                }
+            elif action_roll < 0.8:  # 20% chance to train
+                troop_type = self.get_optimal_troop_type()
+                quantity = 1  # Train only 1 at a time
+                return {
+                    'action': 'train',
+                    'troop_type': troop_type,
+                    'quantity': quantity
+                }
+            else:  # 20% chance to explore
+                total_troops = sum(self.state.troops.values())
+                if total_troops > 0:
                     return {
                         'action': 'explore',
-                        'explore_type': 'scout',  # Focus on land gaining
+                        'explore_type': 'scout',
                         'direction': random.choice(['north', 'south', 'east', 'west']),
-                        'troop_count': min(10, sum(self.state.troops.values()) // 2)  # Send half troops
-                    }
-            elif action_roll < 0.95:  # 15% chance to train troops (for exploration)
-                troop_type = self.get_optimal_troop_type()
-                quantity = max(1, min(5, self.calculate_training_quantity(troop_type)))  # Very small quantities
-                return {
-                    'action': 'train',
-                    'troop_type': troop_type,
-                    'quantity': quantity
-                }
-            else:  # 5% chance to build essential buildings only
-                # Only build essential early game buildings
-                essential_buildings = ['Houses', 'Grain Farms', 'Barracks']
-                building_type = random.choice(essential_buildings)
-                quantity = max(1, min(2, self._calculate_building_quantity_fixed(building_type)))  # Ultra small quantities
-                return {
-                    'action': 'build',
-                    'building_type': building_type,
-                    'quantity': quantity
-                }
-                
-        elif self.state.game_phase == 'mid' or self.state.territory_size < 500:  # MID GAME
-            log.info(f"🏗️ MID GAME STRATEGY: {self.state.territory_size} land - BUILDING FOCUSED")
-
-            # MID GAME: 40% building, 30% exploration, 30% troops
-            if action_roll < 0.4:  # 40% chance to build infrastructure
-                building_type = self.get_optimal_building_type()
-                quantity = max(1, min(10, self._calculate_building_quantity_fixed(building_type)))  # Conservative quantities
-                return {
-                    'action': 'build',
-                    'building_type': building_type,
-                    'quantity': quantity
-                }
-            elif action_roll < 0.7:  # 30% chance to explore
-                if self.should_explore():
-                    self.state.last_explore_time = time.time()
-                    return {
-                        'action': 'explore',
-                        'explore_type': random.choice(list(EXPLORE_TYPES.keys())),
-                        'direction': random.choice(['north', 'south', 'east', 'west'])
-                    }
-            else:  # 30% chance to train troops
-                troop_type = self.get_optimal_troop_type()
-                quantity = max(1, min(20, self.calculate_training_quantity(troop_type)))
-                return {
-                    'action': 'train',
-                    'troop_type': troop_type,
-                    'quantity': quantity
-                }
-
-        else:  # Mid/late game - more aggressive
-            if action_roll < 0.4:  # 40% chance to train troops
-                troop_type = self.get_optimal_troop_type()
-                quantity = self.calculate_training_quantity(troop_type)
-                return {
-                    'action': 'train',
-                    'troop_type': troop_type,
-                    'quantity': quantity
-                }
-            elif action_roll < 0.7:  # 30% chance to build
-                building_type = self.get_optimal_building_type()
-                quantity = self._calculate_building_quantity_fixed(building_type)
-                return {
-                    'action': 'build',
-                    'building_type': building_type,
-                    'quantity': quantity
-                }
-            else:  # 30% chance to attack
-                if self.should_attack():
-                    self.state.last_attack_time = time.time()
-                    total_troops = sum(self.state.troops.values())
-                    attack_force = int(total_troops * random.uniform(0.3, 0.7))
-                    return {
-                        'action': 'attack',
-                        'target': self.choose_target_kingdom(),
-                        'attack_type': random.choice(list(ATTACK_TYPES.keys())),
-                        'troop_count': max(1, attack_force)
+                        'troop_count': 1
                     }
                 else:
-                    # Fallback to training
-                    troop_type = self.get_optimal_troop_type()
-                    quantity = self.calculate_training_quantity(troop_type)
+                    # Fallback to training if no troops
                     return {
                         'action': 'train',
-                        'troop_type': troop_type,
-                        'quantity': quantity
+                        'troop_type': 'foot',
+                        'quantity': 1
                     }
     
     async def execute_intelligent_action(self, api_client: ApiClient) -> Dict[str, Any]:
@@ -4144,208 +4055,49 @@ async def main():
     finally:
         await api_client.client.aclose()
 
-# ---------- CLI ----------
-def create_parser() -> argparse.ArgumentParser:
-    """Create command line argument parser"""
-    parser = argparse.ArgumentParser(
-        description="KG2 AI Bot - Advanced Automated Kingdom Management",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py auto                                    # Full AI mode
-  python main.py train --troop foot --qty 10
-  python main.py build --building barracks --count 2
-  python main.py spy --target 1234 --type infiltrate
-  python main.py explore --type scout --direction north
-  python main.py attack --target 1234 --type raid --troops 50
-        """
-    )
+# Health check server for deployment
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Handle GET requests for health checks"""
+        if self.path == "/" or self.path == "/health":
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {
+                "status": "healthy",
+                "bot": "KG2 AI Bot",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "uptime": time.time() - start_time if 'start_time' in globals() else 0
+            }
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
     
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    def log_message(self, format, *args):
+        # Suppress HTTP server logs to keep bot logs clean
+        pass
 
-    # Auto AI mode
-    auto_parser = subparsers.add_parser("auto", help="Full AI automation mode")
-    auto_parser.add_argument("--aggressiveness", type=float, default=AGGRESSIVENESS_LEVEL,
-                            help=f"AI aggressiveness level 0.0-1.0 (default: {AGGRESSIVENESS_LEVEL})")
-
-    # Train command
-    train_parser = subparsers.add_parser("train", help="Train troops")
-    train_parser.add_argument("--troop", required=True, choices=list(TROOP_TYPES.keys()),
-                             help="Type of troop to train")
-    train_parser.add_argument("--qty", type=int, required=True,
-                             help="Total quantity to train")
-    train_parser.add_argument("--per", type=int, default=1,
-                             help="Quantity per API call (default: 1)")
-    train_parser.add_argument("--concurrent", type=int, default=DEFAULT_CONCURRENCY,
-                             help=f"Number of concurrent calls (default: {DEFAULT_CONCURRENCY})")
-
-    # Build command
-    build_parser = subparsers.add_parser("build", help="Build buildings")
-    build_parser.add_argument("--building", required=True, choices=list(BUILDING_TYPES.keys()),
-                             help="Type of building to build")
-    build_parser.add_argument("--count", type=int, default=1,
-                             help="Number of buildings to build (default: 1)")
-    build_parser.add_argument("--concurrent", type=int, default=DEFAULT_CONCURRENCY,
-                             help=f"Number of concurrent calls (default: {DEFAULT_CONCURRENCY})")
-
-    # Spy command
-    spy_parser = subparsers.add_parser("spy", help="Spy on other kingdoms")
-    spy_parser.add_argument("--target", type=int, required=True,
-                           help="Target kingdom ID")
-    spy_parser.add_argument("--type", required=True, choices=list(SPY_TYPES.keys()),
-                           help="Type of spy mission")
-    spy_parser.add_argument("--count", type=int, default=1,
-                           help="Number of spies to send (default: 1)")
-
-    # Explore command
-    explore_parser = subparsers.add_parser("explore", help="Explore territories")
-    explore_parser.add_argument("--type", required=True, choices=list(EXPLORE_TYPES.keys()),
-                                help="Type of exploration")
-    explore_parser.add_argument("--direction", choices=["north", "south", "east", "west"],
-                                default="north", help="Direction to explore (default: north)")
-    explore_parser.add_argument("--distance", type=int, default=1,
-                                help="Distance to explore (default: 1)")
-
-    # Attack command
-    attack_parser = subparsers.add_parser("attack", help="Attack other kingdoms")
-    attack_parser.add_argument("--target", type=int, required=True,
-                               help="Target kingdom ID")
-    attack_parser.add_argument("--type", required=True, choices=list(ATTACK_TYPES.keys()),
-                               help="Type of attack")
-    attack_parser.add_argument("--troops", type=int, required=True,
-                               help="Number of troops to send")
-
-    return parser
-
-async def main():
-    """Main application entry point"""
-    # Check for START_CMD in environment
-    start_cmd = env("START_CMD", "auto")  # Default to AI mode
-    if start_cmd and len(sys.argv) == 1:
-        log.info(f"No CLI args provided. Using START_CMD from .env: {start_cmd}")
-        # Remove quotes if present and split properly
-        start_cmd = start_cmd.strip('"').strip("'")
-        sys.argv.extend(shlex.split(start_cmd))
-
-    parser = create_parser()
-    
-    if len(sys.argv) == 1:
-        parser.print_help()
-        return
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return
-
-    # Check for continuous running mode
-    keep_alive = env("KEEP_ALIVE", "false").lower() in ["true", "1", "yes"]
-
-    # Create API client and AI system
-    api_client = await create_client()
-    ai_system = AdvancedAI() if args.command == "auto" else None
-
-    # Override aggressiveness if specified
-    if args.command == "auto" and hasattr(args, 'aggressiveness'):
-        global AGGRESSIVENESS_LEVEL
-        AGGRESSIVENESS_LEVEL = args.aggressiveness
-        log.info(f"🤖 AI aggressiveness set to {AGGRESSIVENESS_LEVEL}")
-    
-    try:
-        while True:
-            try:
-                if args.command == "auto":
-                    # Full AI automation mode
-                    if ai_system is not None:
-                        log.info("🤖 AI taking intelligent action...")
-                        result = await ai_system.execute_intelligent_action(api_client)
-
-                        # Add human-like random delay
-                        delay = ai_system.get_random_delay()
-                        log.info(f"💤 Waiting {delay} seconds (human-like behavior)...")
-                        await asyncio.sleep(delay)
-                    else:
-                        log.error("AI system not initialized for auto mode")
-                        break
-
-                elif args.command == "train":
-                    results = await concurrent_action(
-                        action_func=lambda **kwargs: train_population(api_client, args.troop, **kwargs),
-                        total_quantity=args.qty,
-                        per_call=args.per,
-                        concurrency=args.concurrent
-                    )
-                    log.info(f"Training completed. {len(results)} successful calls.")
-
-                elif args.command == "build":
-                    results = await concurrent_action(
-                        action_func=lambda **kwargs: build_building(api_client, args.building, **kwargs),
-                        total_quantity=args.count,
-                        per_call=1,  # Build one at a time
-                        concurrency=args.concurrent
-                    )
-                    log.info(f"Building completed. {len(results)} successful calls.")
-
-                elif args.command == "spy":
-                    result = await spy_on_kingdom(
-                        api_client,
-                        args.target,
-                        args.type,
-                        args.count
-                    )
-                    log.info(f"Spy mission completed on kingdom {args.target}")
-
-                elif args.command == "explore":
-                    result = await explore_territory(
-                        api_client,
-                        args.type,
-                        args.direction,
-                        args.distance
-                    )
-                    log.info(f"Exploration completed: {args.type} {args.direction}")
-
-                elif args.command == "attack":
-                    result = await attack_kingdom(
-                        api_client,
-                        args.target,
-                        args.type,
-                        args.troops
-                    )
-                    log.info(f"Attack completed on kingdom {args.target} with {args.troops} troops")
-
-                # If keep_alive is disabled, run once and exit
-                if not keep_alive:
-                    log.info("Single execution completed.")
-                    break
-
-                # For AI mode, use random delays; for manual commands, use fixed delay
-                if args.command == "auto":
-                    # AI mode already handled its own delay above
-                    pass
-                else:
-                    # Regular commands - wait before next execution
-                    wait_time = int(env("LOOP_DELAY_MINUTES", "5")) * 60
-                    log.info(f"Waiting {wait_time//60} minutes before next execution...")
-                    await asyncio.sleep(wait_time)
-
-            except Exception as e:
-                log.error(f"Command failed: {e}")
-
-                if not keep_alive:
-                    sys.exit(1)
-                else:
-                    # In continuous mode, wait and retry
-                    retry_delay = int(env("ERROR_RETRY_DELAY_MINUTES", "2")) * 60
-                    log.info(f"Retrying in {retry_delay//60} minutes...")
-                    await asyncio.sleep(retry_delay)
-                    continue
-
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user")
-
-    finally:
-        await api_client.client.aclose()
+def start_health_server():
+    """Start health check server in background thread"""
+    port = int(os.environ.get('PORT', 5000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    log.info(f"Health check server starting on port {port}")
+    server.serve_forever()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    global start_time
+    start_time = time.time()
+    
+    # Start health check server in background thread for deployment
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    log.info("Health check server started for deployment")
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Interrupted by user")
+    except Exception as e:
+        log.error(f"Fatal error: {e}")
+        sys.exit(1)
