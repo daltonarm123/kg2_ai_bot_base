@@ -289,14 +289,17 @@ class ApiClient:
         
         # Based on user's API information, these are the correct endpoints
         self._working_endpoints = {
-            "TrainPopulation": f"{BASE_URL}/api/TrainPopulation",
-            "BuildBuilding": f"{BASE_URL}/api/BuildBuilding", 
+            # Updated from user list
+            "TrainPopulation": f"{BASE_URL}/Population.asmx/TrainPopulation",
+            "BuildBuilding": f"{BASE_URL}/Buildings.asmx/BuildBuilding",
+            "Explore": f"{BASE_URL}/Kingdoms.asmx/Explore",
+            "Attack": f"{BASE_URL}/Kingdoms.asmx/AttackKingdom",
+            "Spy": f"{BASE_URL}/Kingdoms.asmx/SpyOnKingdom",
+
+            # Kept from old list
             "Action": f"{BASE_URL}/api/Action",
-            "Spy": f"{BASE_URL}/api/Spy",
             "SpyAction": f"{BASE_URL}/api/SpyAction",
-            "Explore": f"{BASE_URL}/api/Explore",
             "ExploreTerritory": f"{BASE_URL}/api/ExploreTerritory",
-            "Attack": f"{BASE_URL}/api/Attack",
             "Raid": f"{BASE_URL}/api/Raid",
             "Battle": f"{BASE_URL}/api/Battle",
             "GetKingdomInfo": f"{BASE_URL}/api/GetKingdomInfo",
@@ -308,7 +311,55 @@ class ApiClient:
             "Account": f"{BASE_URL}/api/account",
             "User": f"{BASE_URL}/api/user",
             "Kingdom": f"{BASE_URL}/api/kingdom",
-            "Game": f"{BASE_URL}/api/game"
+            "Game": f"{BASE_URL}/api/game",
+
+            # --- Added Endpoints from user list ---
+
+            # Authentication (User.asmx)
+            "UserAppLogin": f"{BASE_URL}/User.asmx/AppLogin",
+            "UserAppRegister": f"{BASE_URL}/User.asmx/AppRegister",
+            "UserCheckToken": f"{BASE_URL}/User.asmx/CheckToken",
+            "UserGetKingdomIdForAccount": f"{BASE_URL}/User.asmx/GetKingdomIdForAccount",
+            "UserRequestAccountTransfer": f"{BASE_URL}/User.asmx/RequestAccountTransfer",
+            "UserTransferAccount": f"{BASE_URL}/User.asmx/TransferAccount",
+            "UserGetSubscriptionDetails": f"{BASE_URL}/User.asmx/GetSubscriptionDetails",
+
+            # Worlds (Worlds.asmx)
+            "WorldsGetWorlds": f"{BASE_URL}/Worlds.asmx/GetWorlds",
+            "WorldsGetAlluviaStatus": f"{BASE_URL}/Worlds.asmx/GetAlluviaStatus",
+            "WorldsGetZethraStatus": f"{BASE_URL}/Worlds.asmx/GetZethraStatus",
+
+            # Payments & Subscriptions (Payments.asmx)
+            "PaymentsFulfillmentHandler": f"{BASE_URL}/Payments.asmx/FulfillmentHandler",
+            "PaymentsValidateSubscription": f"{BASE_URL}/Payments.asmx/ValidateSubscription",
+
+            # Push Notifications (PushNotifications.asmx)
+            "PushNotificationsCreateOrUpdateInstallation": f"{BASE_URL}/PushNotifications.asmx/CreateOrUpdateInstallation",
+
+            # Kingdoms (Kingdoms.asmx)
+            "KingdomsGetKingdomDetails": f"{BASE_URL}/Kingdoms.asmx/GetKingdomDetails",
+            "KingdomsGetKingdomResources": f"{BASE_URL}/Kingdoms.asmx/GetKingdomResources",
+            "KingdomsGetKingdomPopulation": f"{BASE_URL}/Kingdoms.asmx/GetKingdomPopulation",
+            "KingdomsGetKingdomBuildings": f"{BASE_URL}/Kingdoms.asmx/GetKingdomBuildings",
+            "KingdomsGetInProgressItems": f"{BASE_URL}/Kingdoms.asmx/GetInProgressItems",
+            "KingdomsGetReturningForces": f"{BASE_URL}/Kingdoms.asmx/GetReturningForces",
+            "KingdomsSearchByName": f"{BASE_URL}/Kingdoms.asmx/SearchByName",
+            "KingdomsAttackKingdom": f"{BASE_URL}/Kingdoms.asmx/AttackKingdom",
+            "KingdomsSpyOnKingdom": f"{BASE_URL}/Kingdoms.asmx/SpyOnKingdom",
+
+            # Population (Population.asmx)
+            "PopulationGetPopulationTypeList": f"{BASE_URL}/Population.asmx/GetPopulationTypeList",
+            "PopulationGetTrainingCost": f"{BASE_URL}/Population.asmx/GetTrainingCost",
+
+            # Buildings (Buildings.asmx)
+            "BuildingsGetBuildingsTypeList": f"{BASE_URL}/Buildings.asmx/GetBuildingsTypeList",
+            "BuildingsGetBuildingCost": f"{BASE_URL}/Buildings.asmx/GetBuildingCost",
+            "BuildingsCancelBuilding": f"{BASE_URL}/Buildings.asmx/CancelBuilding",
+
+            # Messages (Messages.asmx)
+            "MessagesGetMessages": f"{BASE_URL}/Messages.asmx/GetMessages",
+            "MessagesGetMessage": f"{BASE_URL}/Messages.asmx/GetMessage",
+            "MessagesMarkMessageReadUnread": f"{BASE_URL}/Messages.asmx/MarkMessageReadUnread",
         }
         
         # Test endpoints only if we have an active session
